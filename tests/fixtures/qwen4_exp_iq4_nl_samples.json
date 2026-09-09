@@ -1,0 +1,74 @@
+{
+  "source_repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+  "revision": "38bb39ee97821de2c9009abb7e93950eec396e66",
+  "tensor": "per_layer_token_embd.weight",
+  "type": "IQ4_NL",
+  "width": 160,
+  "original_rows": 320001536,
+  "samples": [
+    {
+      "row": 0,
+      "file": "row-0.bin",
+      "offset": 528499744,
+      "bytes": 90,
+      "sha256": "4b067ea426d9767a81185b36042c6612de8a5f41fca76b97feb4bc5b8298f1ab",
+      "packed_base64": "UYxrhG2EmrZq5jdXQQ268xIHcwxDhm2HXrYGZrzJyw1Ilh5WUQz6js9UCc54nKw5EcxaVCZwXo1av2BKVl7KpKVlubx5i5qGDYyOeceDThNLYRQ8A2jYne96"
+    },
+    {
+      "row": 1,
+      "file": "row-1.bin",
+      "offset": 528499834,
+      "bytes": 90,
+      "sha256": "e4b74dc69c263c3505606377157e6f60a9ddb967a1637c43e01ebce11f0a096d",
+      "packed_base64": "FwiqHJpswpw8GUZHfatJLApG4Qn7d5PMYKTJmEe7qXWSlnHY2As8hYjWaodnVt3Fl16ZR1MC44k4l5xk2M4pe6h9TE8AvMmkPYl7m/2ThEmVtmJ0B7VjXUbU"
+    },
+    {
+      "row": 2,
+      "file": "row-2.bin",
+      "offset": 528499924,
+      "bytes": 90,
+      "sha256": "ec29bab91b16efbbba5a2a79a7c9871cf488a2d70a56d2ac0eb3e767383c3677",
+      "packed_base64": "gwh0tz5X28qjTGhqhgPSRmZ5mYjBK9tUDk2lvlaQQilNzKxN7Qldjq0oWHiFk2iAVpv8PIgtdIi1ZEeJOWkWb4kGbLqfibGWnQiNntW+U0ik+ZjFoHaXGn22"
+    },
+    {
+      "row": 17,
+      "file": "row-17.bin",
+      "offset": 528501274,
+      "bytes": 90,
+      "sha256": "046d96f8c3e99058520516e52d969f25eab1664121d775090377d5fca0185d7d",
+      "packed_base64": "vYdyCrOux2MrMhz5SF4QKl7FQ4j4CB3TCmnm3H9n49Swq8ZMhwlJWaN4TfaTogpM5N6LWp4ydwg4wKB81JXOY7t7K/koSFnRHQhQmORZUol2lDaasoq0l9zc"
+    },
+    {
+      "row": 1007,
+      "file": "row-1007.bin",
+      "offset": 528590374,
+      "bytes": 90,
+      "sha256": "25a919fb2f0f342fec0b83a74a8a6ea20ca8ae684c801c592be1e3b45fcdffee",
+      "packed_base64": "XYeenMnVYDfjQK2t6RLSa3rdFoqqBnZzTMXOZ4nIZ2S0fVWaDYlZUDJrHMjaOZ5aWIB+dVRMgYhl6V3Bl2kpSw4u8rq5RzZvzQp4tDx3XM68PghcjIdZGJpE"
+    },
+    {
+      "row": 2500011,
+      "file": "row-2500011.bin",
+      "offset": 753500734,
+      "bytes": 90,
+      "sha256": "db595b2444a0f9250021978d4a74870a2ebc374c244e889b3de9c84ea84ab801",
+      "packed_base64": "SAiPNcmU1oOUXY6kbGCCKKmKt4b65UqdbuB1vODUuJ1fjJnmCIl42ZhKpF0JqGICbIdFdyGGlImbgiZECIvcklqlpIlnU7dKcIjcjW+tZmTd/lmzhzDEq1jQ"
+    },
+    {
+      "row": 2500012,
+      "file": "row-2500012.bin",
+      "offset": 753500824,
+      "bytes": 90,
+      "sha256": "22bd833f80517ef0fed7ce8b0c7f85331f2fb36c250e990a6f56d22f7082afb0",
+      "packed_base64": "l4glJi+rWXuT2GzUutvUyh0E6QiJTDS/maqtFrNsgLqjMmK/RwnMk2u7qURkwuk4IFq3h3n94Ig4e2ljS6aGu0oEVn2p7Ka5vgalGv00icVqDrpv+/nV76Jb"
+    },
+    {
+      "row": 320001535,
+      "file": "row-320001535.bin",
+      "offset": 29328637894,
+      "bytes": 90,
+      "sha256": "c49cc01df9374e67644ae0c953d006bf3f3e112c1c2885d0c7677be5db7b1b44",
+      "packed_base64": "AACIiIiIiIiIiIiIiIiIiIiIAACIiIiIiIiIiIiIiIiIiIiIAACIiIiIiIiIiIiIiIiIiIiIAACIiIiIiIiIiIiIiIiIiIiIAACIiIiIiIiIiIiIiIiIiIiI"
+    }
+  ]
+}

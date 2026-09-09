@@ -1,0 +1,307 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable
+from typing import TYPE_CHECKING
+
+import gguf
+import torch
+from vllm.logger import init_logger
+
+from ..gguf_files import GGUFModelFiles
+from ..gguf_utils import maybe_patch_hf_config_from_gguf
+from ..weight_utils import get_gguf_tensor_names, split_stacked_experts
+from .base import GGUFWeight
+from .qwen3_5 import Qwen35GGUFAdapter, _gdn_value_head_layout
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+    from vllm.config import ModelConfig
+
+logger = init_logger(__name__)
+
+QWEN4_EXP_MODEL_TYPES = ("qwen4_exp",)
+# The retained vLLM image exposes the Qwen4Exp config under the
+# qwen3_8_flash_next model package and uses this concrete architecture name.
+QWEN4_EXP_ARCHITECTURE = "Qwen3_8FlashNextForConditionalGeneration"
+
+_LAYER_SUBSTR = {
+    # Gated delta-net / linear-attention names emitted by the pinned converter.
+    "attn_qkv.": "linear_attn.in_proj_qkv.",
+    "attn_gate.": "linear_attn.in_proj_z.",
+    "ssm_alpha.": "linear_attn.in_proj_a.",
+    "ssm_beta.": "linear_attn.in_proj_b.",
+    "ssm_conv1d.": "linear_attn.conv1d.",
+    "ssm_norm.": "linear_attn.norm.",
+    "ssm_out.": "linear_attn.out_proj.",
+    "ssm_dt.bias": "linear_attn.dt_bias",
+    "ssm_a.weight": "linear_attn.A_log.weight",
+    "ssm_a": "linear_attn.A_log",
+    # Full attention / QSA names.
+    "attn_q.": "self_attn.q_proj.",
+    "attn_k.": "self_attn.k_proj.",
+    "attn_v.": "self_attn.v_proj.",
+    "attn_output.": "self_attn.o_proj.",
+    "attn_q_norm.": "self_attn.q_norm.",
+    "attn_k_norm.": "self_attn.k_norm.",
+    # The converter splits HF index_qk_proj into q/k GGUF tensors.  These are
+    # intermediate names; transform_weights joins them into native
+    # self_attn.indexer.index_qk_proj before AutoWeightsLoader sees them.
+    "indexer.q_proj.": "self_attn.indexer.q_proj.",
+    "indexer.k_proj.": "self_attn.indexer.k_proj.",
+    "indexer.q_norm.": "self_attn.indexer.q_layernorm.",
+    "indexer.k_norm.": "self_attn.indexer.k_layernorm.",
+    # Hyper-connection projections replace the ordinary attention/FFN norms.
+    "hc_attn_norm.": "attn_hyper_connection.hc_norm.",
+    "hc_attn_down.": "attn_hyper_connection.input_mix_weight_down.",
+    "hc_attn_up.": "attn_hyper_connection.input_mix_weight_up.",
+    "hc_attn_inject.": "attn_hyper_connection.block_inject_weight.",
+    "hc_ffn_norm.": "mlp_hyper_connection.hc_norm.",
+    "hc_ffn_down.": "mlp_hyper_connection.input_mix_weight_down.",
+    "hc_ffn_up.": "mlp_hyper_connection.input_mix_weight_up.",
+    "hc_ffn_inject.": "mlp_hyper_connection.block_inject_weight.",
+    # PLE exists only at the converter's virtual layer (blk.1 for 1-based id 2).
+    "ple_key.": "ple.key_proj.",
+    "ple_value.": "ple.value_proj.",
+    "ple_norm_key.": "ple.norm_key.",
+    "ple_norm_query.": "ple.norm_query.",
+    "ple_norm_conv.": "ple.norm_conv.",
+    "ple_conv1d.": "ple.conv1d.",
+    # Mixture-of-experts and shared expert names.
+    "ffn_gate_inp_shexp.": "mlp.shared_expert_gate.",
+    "ffn_gate_inp.": "mlp.gate.",
+    "ffn_gate_exps.": "mlp.experts.0.gate_proj.",
+    "ffn_up_exps.": "mlp.experts.0.up_proj.",
+    "ffn_down_exps.": "mlp.experts.0.down_proj.",
+    "ffn_gate_shexp.": "mlp.shared_expert.gate_proj.",
+    "ffn_up_shexp.": "mlp.shared_expert.up_proj.",
+    "ffn_down_shexp.": "mlp.shared_expert.down_proj.",
+}
+
+_TOP_PREFIX = {
+    "token_embd.": "embed_tokens.",
+    "output_norm.": "norm.",
+    "output.": "lm_head.",
+    "output_hc_norm.": "hyper_connection_mixer.hc_norm.",
+    "output_hc_down.": "hyper_connection_mixer.input_mix_weight_down.",
+    "output_hc_up.": "hyper_connection_mixer.input_mix_weight_up.",
+}
+
+_PLE_PACKED_SUFFIX = "per_layer_token_embd.weight"
+
+
+def _is_hc_projection(name: str) -> bool:
+    return "hyper_connection" in name and name.removesuffix(".weight").rsplit(".", 1)[
+        -1
+    ] in {"input_mix_weight_down", "input_mix_weight_up", "block_inject_weight"}
+
+
+def _map_layer_name(name: str, backbone_prefix: str) -> str | None:
+    match = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
+    if match is None:
+        return None
+    layer_prefix = f"{backbone_prefix}layers.{match.group(1)}."
+    suffix = match.group(2)
+    for source, target in _LAYER_SUBSTR.items():
+        if suffix.startswith(source):
+            return layer_prefix + target + suffix[len(source) :]
+    return None
+
+
+def _map_name(name: str, backbone_prefix: str, *, multimodal: bool) -> str | None:
+    for source, target in _TOP_PREFIX.items():
+        if name.startswith(source):
+            if target == "lm_head.":
+                return target + name[len(source) :]
+            return backbone_prefix + target + name[len(source) :]
+    if name == _PLE_PACKED_SUFFIX:
+        # This is intentionally a visible intermediate target.  The native
+        # Qwen4Exp loader has no GGUF IQ4_NL row-table hook in this plugin yet;
+        # transform_weights raises before an unsafe eager load can occur.
+        return backbone_prefix + "per_layer_token_embd.weight"
+    return _map_layer_name(name, backbone_prefix)
+
+
+class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
+    """Map the pinned Qwen4Exp GGUF export to native Qwen4Exp vLLM names.
+
+    The converter emits the same gated-delta-net projections as Qwen3.5, but
+    adds QSA, hyper-connections, and PLE tensors.  Inheriting the GDN layout
+    declaration and restoration helpers keeps the V-head reorder tied to the
+    existing, tested vLLM GGUF layout contract.
+    """
+
+    @classmethod
+    def matches(cls, config: PretrainedConfig) -> bool:
+        return config.model_type in QWEN4_EXP_MODEL_TYPES
+
+    @classmethod
+    def architecture(cls, config: PretrainedConfig) -> str | None:
+        del config
+        return QWEN4_EXP_ARCHITECTURE
+
+    def patch_hf_config(
+        self,
+        files: GGUFModelFiles,
+        hf_config: PretrainedConfig,
+    ) -> PretrainedConfig:
+        if getattr(hf_config.get_text_config(), "ple_layer_ids", []):
+            raise NotImplementedError(
+                "The GGUF CPU PLE worker is not wired into the native loader; "
+                "refusing model construction before any full PLE allocation. "
+                "Only configuration, mapping, and selected-row CPU probes are "
+                "qualified by this experimental adapter."
+            )
+        patched = maybe_patch_hf_config_from_gguf(
+            files.primary_backbone,
+            hf_config,
+            mmproj_path=files.mm_proj,
+        )
+        patched.architectures = [QWEN4_EXP_ARCHITECTURE]
+        return patched
+
+    def build_name_map(
+        self,
+        files: GGUFModelFiles,
+        model_config: ModelConfig,
+    ) -> dict[str, str]:
+        if files.mm_proj is not None:
+            raise NotImplementedError(
+                "This Qwen4Exp experiment is text-only; vision GGUF loading "
+                "has not been adapted."
+            )
+        multimodal = False
+        # Preserve checkpoint-style names even when no vision tower is loaded.
+        # Both native causal and conditional model mappers accept this prefix.
+        backbone_prefix = "model.language_model."
+        tensor_names = sorted(get_gguf_tensor_names(files.all_files))
+        name_map: dict[str, str] = {}
+        unmapped: list[str] = []
+        for name in tensor_names:
+            mapped = _map_name(name, backbone_prefix, multimodal=multimodal)
+            if mapped is None:
+                unmapped.append(name)
+            else:
+                name_map[name] = mapped
+        if unmapped:
+            raise RuntimeError(
+                "Found unmapped Qwen4Exp GGUF tensor(s); refusing to drop "
+                f"them: {unmapped}"
+            )
+        logger.info("Mapped %d Qwen4Exp GGUF tensors", len(name_map))
+        del model_config
+        return name_map
+
+    def transform_weights(
+        self,
+        weights: Iterable[GGUFWeight],
+        model_config: ModelConfig,
+    ) -> Iterable[GGUFWeight]:
+        text_config = model_config.hf_config.get_text_config()
+        layout = _gdn_value_head_layout(text_config)
+
+        def transformed() -> Iterable[GGUFWeight]:
+            quantized_bases: set[str] = set()
+            quantized_types: dict[str, int] = {}
+            indexer_parts: dict[str, dict[str, torch.Tensor]] = {}
+            for name, weight in weights:
+                if name.endswith(_PLE_PACKED_SUFFIX):
+                    raise NotImplementedError(
+                        "Qwen4Exp packed PLE table per_layer_token_embd.weight "
+                        "requires the bounded IQ4_NL row lookup loader; refusing "
+                        "to materialize or substitute the 102.4 GB BF16 table."
+                    )
+                if name.endswith(".weight_type"):
+                    base = name.removesuffix(".weight_type")
+                    quantized_bases.add(base)
+                    if base.endswith((".indexer.q_proj", ".indexer.k_proj")):
+                        raise NotImplementedError(
+                            "Qwen4Exp quantized indexer Q/K merging is not "
+                            "qualified; the selected checkpoint uses BF16."
+                        )
+                    if _is_hc_projection(base + ".weight"):
+                        quant_type = int(weight.item())
+                        if quant_type != int(gguf.GGMLQuantizationType.Q8_0):
+                            raise NotImplementedError(
+                                "Only the selected checkpoint's Q8_0 HC "
+                                "projections have been qualified for decoding"
+                            )
+                        quantized_types[base] = quant_type
+                        # Native HC modules deliberately use quant_config=None.
+                        # Their loader accepts floating weights, not descriptors.
+                        continue
+                if (
+                    _is_hc_projection(name)
+                    and name.removesuffix(".weight") in quantized_types
+                ):
+                    if weight.device.type != "cpu":
+                        raise ValueError("GGUF HC decoding expects CPU packed weights")
+                    decoded = gguf.dequantize(
+                        weight.detach().numpy(), gguf.GGMLQuantizationType.Q8_0
+                    )
+                    yield (
+                        name,
+                        torch.from_numpy(decoded).to(
+                            getattr(model_config, "dtype", torch.bfloat16)
+                        ),
+                    )
+                    continue
+                if name.endswith(".self_attn.indexer.q_proj.weight"):
+                    prefix = name.removesuffix(".q_proj.weight")
+                    indexer_parts.setdefault(prefix, {})["q"] = weight
+                    continue
+                if name.endswith(".self_attn.indexer.k_proj.weight"):
+                    prefix = name.removesuffix(".k_proj.weight")
+                    indexer_parts.setdefault(prefix, {})["k"] = weight
+                    continue
+                if layout is not None:
+                    reordered = self._restore_gdn_weight(
+                        name, weight, text_config, layout, quantized_bases
+                    )
+                    if reordered is not None:
+                        yield name, reordered
+                        continue
+                if name.endswith(".A_log"):
+                    yield name, torch.log(-weight)
+                    continue
+                if (
+                    name.endswith("norm.weight")
+                    and not name.endswith("linear_attn.norm.weight")
+                ) or name.endswith(
+                    (
+                        ".ple.norm_key.weight",
+                        ".ple.norm_query.weight",
+                        ".ple.norm_conv.weight",
+                    )
+                ):
+                    yield name, weight - 1
+                    continue
+                if name.endswith(".conv1d.weight") and weight.dim() == 2:
+                    weight = weight.unsqueeze(1)
+                elif (
+                    name.endswith(".weight")
+                    and weight.dim() == 1
+                    and "norm" not in name
+                    and name.removesuffix(".weight") not in quantized_bases
+                ):
+                    weight = weight.unsqueeze(0)
+                yield name, weight
+
+            for prefix, parts in indexer_parts.items():
+                if set(parts) != {"q", "k"}:
+                    raise RuntimeError(
+                        "Qwen4Exp indexer q/k projection pair is incomplete for "
+                        f"{prefix}: got {sorted(parts)}"
+                    )
+                yield (
+                    f"{prefix}.index_qk_proj.weight",
+                    torch.cat((parts["q"], parts["k"]), dim=0),
+                )
+
+        yield from split_stacked_experts(transformed())
+
+
+__all__ = ["Qwen4ExpGGUFAdapter"]
