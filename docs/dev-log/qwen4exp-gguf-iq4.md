@@ -502,6 +502,61 @@ for community support.
   test under load are untested; and the stack depends on a vLLM nightly plus the
   unmerged #56273.
 
+### 2026-09-11 — P3 run 13: 64K context and concurrency limits
+
+- Same tree as run 12, `--max-model-len 65536 --max-num-seqs 96
+  --gpu-memory-utilization 0.90`, BF16 KV (`.dev/p3/p3-serve-64k.sh`). vLLM
+  defaults left on: chunked prefill (`max_num_batched_tokens=8192`), prefix
+  caching with the GDN state cache in `align` mode, attention block size 1568
+  tokens. torch.compile stays off (upstream #55272 removed it for this model).
+- Memory: weights on the GPU 61.84 GiB; KV cache 20.86 GiB, 723,466 tokens, which
+  vLLM reports as 11.04 concurrent 65,536-token requests. By GGUF tensor bytes the
+  routed experts are 55.43 GiB (IQ3_S 31.56, IQ4_NL 18.90, Q8_0 4.15, IQ4_XS 0.83),
+  the PLE table 26.85 GiB (host, pinned), attention/GDN/indexer 3.04 GiB, embedding
+  and output 1.12 GiB. The BF16 main KV alone is 24 KiB per token (12 full-attention
+  layers × 2 KV heads × 256).
+- Load harness `.dev/p3/p3-bench.py` streams requests at a fixed concurrency and
+  samples `/metrics` (running, waiting, KV usage, preemptions). Evidence
+  `.dev/evidence/q4gguf-p3-bench-run13-*.log`.
+- Short prompts, 256-token answers with `ignore_eos`:
+
+  | concurrency | tok/s total | tok/s per request | first token | peak KV |
+  |---|---|---|---|---|
+  | 32 | 552.9 | 19.7 | 1.84 s | 34.2% |
+  | 48 | 572.7 | 13.3 | 2.23 s | 51.2% |
+  | 64 | 591.0 | 10.3 | 3.05 s | 68.3% |
+  | 82 | 558.1 | 7.6 | 3.96 s | 87.5% |
+
+  No errors or preemptions. KV usage grows by about 1.07% per request whatever its
+  length, so a short request's cost is dominated by its GDN state pages, and the
+  pool holds about 93 sequences.
+- 64K prompts (63,4xx tokens, an access code buried at the middle), greedy:
+  - short answers at concurrency 1, 4 and 8: every code correct; first token
+    80.7 s alone, p50/max 268/329 s at 4 and 430/660 s at 8. Only two requests
+    were ever running, the rest waited; prompt throughput was about 770 tokens per
+    second at every level, against about 8,500 at 13,847 tokens in run 11.
+  - answers held to 1,024 tokens (`ignore_eos`) at 8 and 12: every code correct;
+    at most 7 requests ran at once with KV usage 96.4%, the rest queued (up to 11
+    waiting) and none was preempted; first token p50/max 430/679 s at 8 and
+    578/1,010 s at 12; decode 11.9 tokens per second in aggregate.
+  - one 64K request takes 13.2–13.8% of the pool, so the practical limit is 7
+    concurrent 64K requests, not the 11.04 that vLLM's startup estimate gives
+    (the estimate leaves out the blocks the GDN groups hold per request).
+- During the first long requests vLLM warned about Triton JIT for
+  `_qsa_pre_indexer_kernel`, `_qsa_mqa_paged_prefill_kernel`, `_ple_conv_kernel`
+  and `_ple_conv_writeback_kernel`: warm-up does not cover these shapes.
+- Harness note: `tmux kill-session` did not stop a running benchmark client (the
+  process outlived its session), so the first held-answer attempt shared the
+  server with a leftover level and was discarded
+  (`q4gguf-p3-bench-run13-hold-contaminated.log`); the rerun started on an idle
+  server, checked through `/metrics`.
+- Levers for the KV limit: an FP8 main KV on the QSA path (rejected by the pinned
+  nightly, `nvidia/qsa.py` raises unless BF16; upstream #55557 is approved but not
+  merged) halves the 24 KiB per token but not the GDN pages; a higher memory
+  fraction; and prefix caching off, which removes the `align` state blocks at the
+  cost of prefix reuse. The GGUF carries no MTP tensors (1,224 tensors, `blk.0`
+  to `blk.47`), although `config.json` declares one MTP layer.
+
 ## Design decisions
 
 ### D1 — Implement IQ4_NL as a Level-3 PLE embedding method, not a worker
