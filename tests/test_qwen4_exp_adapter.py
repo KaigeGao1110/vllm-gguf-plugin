@@ -119,6 +119,133 @@ def test_qwen4_exp_rejects_unknown_converter_tensor_names(monkeypatch):
         qwen4_exp.Qwen4ExpGGUFAdapter().build_name_map(files, model_config)
 
 
+def _load_tensor_directory_fixture() -> dict:
+    return json.loads(
+        (Path(__file__).parent
+         / "fixtures/qwen4_exp_iq4_xs_tensor_directory.json").read_text()
+    )
+
+
+def test_qwen4_exp_replays_all_fixture_names_to_unique_targets(monkeypatch):
+    """Every one of the 1,224 real tensor names maps to exactly one target."""
+    from vllm_gguf_plugin.weights_adapter import qwen4_exp
+
+    fixture = _load_tensor_directory_fixture()
+    names = {t["name"] for t in fixture["tensors"]}
+    assert len(names) == fixture["tensor_count"] == 1224
+
+    monkeypatch.setattr(qwen4_exp, "get_gguf_tensor_names", lambda _: names)
+    files = SimpleNamespace(all_files=("fixture.gguf",) * 3, mm_proj=None)
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="qwen4_exp", get_text_config=lambda: SimpleNamespace()
+        )
+    )
+
+    mapped = qwen4_exp.Qwen4ExpGGUFAdapter().build_name_map(files, model_config)
+
+    assert len(mapped) == 1224
+    ple_target = mapped["per_layer_token_embd.weight"]
+    assert ple_target == "model.language_model.per_layer_token_embd.weight"
+    non_ple_targets = [
+        target for name, target in mapped.items() if name != "per_layer_token_embd.weight"
+    ]
+    assert len(non_ple_targets) == 1223
+    assert len(set(non_ple_targets)) == 1223, "duplicate mapping targets"
+    assert ple_target not in set(non_ple_targets)
+
+
+def test_qwen4_exp_ple_expands_to_nightly_shard_names_resolving_under_the_model():
+    """The PLE table expands to exactly the shard names the nightly accepts.
+
+    The expected names are derived, not hand-written: the checkpoint prefix
+    comes from ``Qwen4ExpForConditionalGeneration.hf_to_vllm_mapper``, the
+    module path segments from the nightly decoder-layer / PLE / ngram
+    attribute assignments, and the zero-based layer index from the
+    1-based ``ple_layer_ids`` convention the decoder layer implements.
+    """
+    import inspect
+
+    from vllm_gguf_plugin.weights_adapter import qwen4_exp
+    from vllm.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+    from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpDecoderLayer
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding
+    from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
+
+    text_config = SimpleNamespace(
+        ple_layer_ids=[2],
+        split_ngram_parts=128,
+        ngram_size=3,
+        heads_per_ngram=8,
+        ngram_vocab_size_base=20_000_000,
+        make_ngram_vocab_size_divisible_by=128,
+        ple_embed_dim=2560,
+    )
+    shard_names = qwen4_exp._ngram_ple_shard_names(text_config)
+    assert len(shard_names) == 128
+
+    # 1-based config ids attach to zero-based layer id - 1.
+    assert "(self.layer_idx + 1) in ple_layer_ids" in inspect.getsource(
+        Qwen4ExpDecoderLayer.__init__
+    )
+    assert "self.ple = Qwen4ExpPLELayer(" in inspect.getsource(
+        Qwen4ExpDecoderLayer.__init__
+    )
+    assert "self.ple_embedding = Qwen4ExpNGramEmbedding(" in inspect.getsource(
+        Qwen4ExpPLELayer.__init__
+    )
+    assert "self.ngram_embedding = embedding_cls(" in inspect.getsource(
+        Qwen4ExpNGramEmbedding.__init__
+    )
+    # The nightly loader accepts ngram_embedding.shard_{i}.weight names.
+    assert "ngram_embedding.shard_" in inspect.getsource(
+        Qwen4ExpNGramEmbedding.load_weights
+    )
+
+    mapper = Qwen4ExpForConditionalGeneration.hf_to_vllm_mapper
+    language_prefix = mapper.orig_to_new_prefix["model.language_model."]
+    for i, name in enumerate(shard_names):
+        expected = (
+            "model.language_model.layers.1.ple.ple_embedding."
+            f"ngram_embedding.shard_{i}.weight"
+        )
+        assert name == expected
+        # Under the nightly mapper the checkpoint name reaches the PLE module.
+        assert mapper.apply_list([name]) == [
+            f"{language_prefix}layers.1.ple.ple_embedding."
+            f"ngram_embedding.shard_{i}.weight"
+        ]
+
+
+def test_qwen4_exp_padded_ngram_vocab_matches_nightly_layout():
+    """The plugin's prime layout must equal the nightly's, padded or not."""
+    from vllm_gguf_plugin.weights_adapter import qwen4_exp
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding
+
+    base = 20_000_000
+    ngram_heads = (3 - 1) * 8
+    _, _, total = Qwen4ExpNGramEmbedding._make_vocab_layout(
+        ngram_vocab_size_base=base,
+        ngram_heads=ngram_heads,
+        ple_dense_layer_id=0,
+    )
+    text_config = SimpleNamespace(
+        ngram_size=3,
+        heads_per_ngram=8,
+        ngram_vocab_size_base=base,
+        make_ngram_vocab_size_divisible_by=1,
+    )
+    assert qwen4_exp._padded_ngram_vocab_size(text_config) == total
+
+    # The real checkpoint: padding to 128 reproduces the GGUF shape exactly.
+    text_config.make_ngram_vocab_size_divisible_by = 128
+    padded = qwen4_exp._padded_ngram_vocab_size(text_config)
+    assert padded == ((total + 127) // 128) * 128
+    fixture = _load_tensor_directory_fixture()
+    ple = next(t for t in fixture["tensors"] if t["name"] == "per_layer_token_embd.weight")
+    assert ple["shape"] == [160, padded]
+
+
 def test_qwen4_exp_joins_converter_indexer_qk_split_for_native_loader():
     from vllm_gguf_plugin.weights_adapter import qwen4_exp
 

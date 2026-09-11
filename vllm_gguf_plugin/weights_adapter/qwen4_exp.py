@@ -141,6 +141,111 @@ def _map_name(name: str, backbone_prefix: str, *, multimodal: bool) -> str | Non
     return _map_layer_name(name, backbone_prefix)
 
 
+def _is_prime64(value: int) -> bool:
+    """Deterministic Miller-Rabin primality test for 64-bit integers.
+
+    Mirrors ``Qwen4ExpNGramEmbedding._is_prime_64`` in the pinned nightly
+    image (vllm/models/qwen4_exp), which derives the per-head n-gram
+    vocabulary sizes; the plugin must stay in sync with it.
+    """
+    if value < 2:
+        return False
+    for prime in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if value % prime == 0:
+            return value == prime
+    exponent = value - 1
+    shifts = 0
+    while exponent % 2 == 0:
+        exponent //= 2
+        shifts += 1
+    for base in (2, 325, 9375, 28178, 450775, 9780504, 1795265022):
+        if base % value == 0:
+            continue
+        witness = pow(base, exponent, value)
+        if witness in (1, value - 1):
+            continue
+        for _ in range(shifts - 1):
+            witness = (witness * witness) % value
+            if witness == value - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def _nth_prime_after(start: int, count: int) -> int:
+    """The ``count``-th prime strictly greater than *start*.
+
+    Mirrors ``Qwen4ExpNGramEmbedding._nth_prime_after`` in the pinned nightly
+    image.
+    """
+    prime = int(start)
+    for _ in range(count):
+        candidate = prime + 1
+        if candidate <= 2:
+            prime = 2
+            continue
+        if candidate % 2 == 0:
+            candidate += 1
+        while not _is_prime64(candidate):
+            candidate += 2
+        prime = candidate
+    return prime
+
+
+def _padded_ngram_vocab_size(text_config, ple_dense_layer_id: int = 0) -> int:
+    """Total padded n-gram vocabulary rows the native loader allocates.
+
+    Mirrors ``Qwen4ExpNGramEmbedding.__init__`` in the pinned nightly image:
+    one prime-sized block per n-gram head (``ngram_heads`` of them for this
+    PLE layer's dense id), padded to a multiple of
+    ``make_ngram_vocab_size_divisible_by``.  The GGUF PLE table must have
+    exactly this many rows.
+    """
+    ngram_heads = (int(text_config.ngram_size) - 1) * int(text_config.heads_per_ngram)
+    base = int(text_config.ngram_vocab_size_base)
+    total = sum(
+        _nth_prime_after(base - 1, ple_dense_layer_id * ngram_heads + head + 1)
+        for head in range(ngram_heads)
+    )
+    divisor = int(text_config.make_ngram_vocab_size_divisible_by)
+    return ((total + divisor - 1) // divisor) * divisor
+
+
+def _ngram_ple_prefix(text_config) -> str:
+    """Checkpoint prefix of one PLE layer's ngram embedding module.
+
+    ``ple_layer_ids`` entries are 1-based; the native decoder layer attaches
+    ``self.ple`` to the zero-based layer whose id+1 appears in the list.
+    The selected GGUF export carries a single packed PLE table, so exactly
+    one entry is qualified.
+    """
+    ple_layer_ids = [int(x) for x in text_config.ple_layer_ids]
+    if len(ple_layer_ids) != 1:
+        raise NotImplementedError(
+            "The selected GGUF export carries one packed PLE table, so a "
+            f"single ple_layer_ids entry is qualified, got {ple_layer_ids}"
+        )
+    layer_index = ple_layer_ids[0] - 1
+    return f"model.language_model.layers.{layer_index}.ple.ple_embedding."
+
+
+def _ngram_ple_shard_names(text_config) -> tuple[str, ...]:
+    """Native checkpoint names the PLE table expands to.
+
+    ``split_ngram_parts`` consecutive shards named exactly as the nightly
+    ``Qwen4ExpNGramEmbedding.load_weights`` accepts:
+    ``ngram_embedding.shard_{i}.weight`` for ``i`` in ``0..parts-1``.
+    """
+    prefix = _ngram_ple_prefix(text_config)
+    parts = int(text_config.split_ngram_parts)
+    if parts <= 0:
+        raise ValueError(f"split_ngram_parts must be positive, got {parts}")
+    return tuple(
+        f"{prefix}ngram_embedding.shard_{i}.weight" for i in range(parts)
+    )
+
+
 class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
     """Map the pinned Qwen4Exp GGUF export to native Qwen4Exp vLLM names.
 
