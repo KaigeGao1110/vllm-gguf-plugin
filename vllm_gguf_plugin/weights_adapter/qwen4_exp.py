@@ -246,6 +246,58 @@ def _ngram_ple_shard_names(text_config) -> tuple[str, ...]:
     )
 
 
+def _ngram_ple_shard_weights(
+    weight: torch.Tensor, text_config
+) -> Iterable[GGUFWeight]:
+    """Expand the packed IQ4_NL PLE table into native shard weights.
+
+    The table arrives as a zero-copy uint8 view of the GGUF payload: one
+    row of ``values_per_row // 32 * 18`` packed bytes per n-gram vocabulary
+    entry, in checkpoint row order.  It is split into
+    ``split_ngram_parts`` consecutive shards of ``ceil(R / parts)`` rows
+    (the last may be shorter; shards beyond the table are yielded with 0
+    rows, which the nightly ``Qwen4ExpNGramEmbedding.load_weights`` expects
+    and uses to mark the parameter loaded).  Every shard is a slice view of
+    the same memory map - nothing here copies the table.
+    """
+    if weight.dtype != torch.uint8:
+        raise ValueError(
+            "The packed PLE table must arrive as raw uint8 bytes, got "
+            f"{weight.dtype}"
+        )
+    rows_total = _padded_ngram_vocab_size(text_config)
+    ngram_heads = (int(text_config.ngram_size) - 1) * int(text_config.heads_per_ngram)
+    values_per_row = int(text_config.ple_embed_dim) // ngram_heads
+    if values_per_row <= 0 or values_per_row % 32:
+        raise ValueError(
+            "A PLE row must hold a positive multiple of the IQ4_NL block "
+            f"size (32) values, got {values_per_row}"
+        )
+    bytes_per_row = values_per_row // 32 * 18
+    expected_bytes = rows_total * bytes_per_row
+    if weight.numel() != expected_bytes:
+        raise ValueError(
+            f"The packed PLE table has {weight.numel()} bytes; the config's "
+            f"padded n-gram vocabulary of {rows_total} rows of "
+            f"{bytes_per_row} packed bytes requires exactly {expected_bytes}"
+        )
+    flat = weight.reshape(-1)
+    prefix = _ngram_ple_prefix(text_config) + "ngram_embedding.shard_"
+    parts = int(text_config.split_ngram_parts)
+    if parts <= 0:
+        raise ValueError(f"split_ngram_parts must be positive, got {parts}")
+    shard_size = (rows_total + parts - 1) // parts
+    for i in range(parts):
+        start = i * shard_size
+        rows = max(0, min(shard_size, rows_total - start))
+        yield (
+            f"{prefix}{i}.weight",
+            flat[start * bytes_per_row : (start + rows) * bytes_per_row].view(
+                rows, bytes_per_row
+            ),
+        )
+
+
 class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
     """Map the pinned Qwen4Exp GGUF export to native Qwen4Exp vLLM names.
 
@@ -348,12 +400,14 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
             quantized_types: dict[str, int] = {}
             indexer_parts: dict[str, dict[str, torch.Tensor]] = {}
             for name, weight in weights:
+                if name.endswith(f"{_PLE_PACKED_SUFFIX}_type"):
+                    # The iterator synthesizes a weight_type companion for
+                    # every quantized tensor; the native PLE loader takes no
+                    # such tensor for the packed table.
+                    continue
                 if name.endswith(_PLE_PACKED_SUFFIX):
-                    raise NotImplementedError(
-                        "Qwen4Exp packed PLE table per_layer_token_embd.weight "
-                        "requires the bounded IQ4_NL row lookup loader; refusing "
-                        "to materialize or substitute the 102.4 GB BF16 table."
-                    )
+                    yield from _ngram_ple_shard_weights(weight, text_config)
+                    continue
                 if name.endswith(".weight_type"):
                     base = name.removesuffix(".weight_type")
                     quantized_bases.add(base)

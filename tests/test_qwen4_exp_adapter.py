@@ -272,22 +272,167 @@ def test_qwen4_exp_joins_converter_indexer_qk_split_for_native_loader():
     assert torch.equal(mapped[0][1], torch.cat((q, k), dim=0))
 
 
-def test_qwen4_exp_surfaces_packed_ple_table_as_unsupported_at_load():
-    from vllm_gguf_plugin.weights_adapter import qwen4_exp
+_PLE_TEST_ROWS = 618  # sum of the two primes 307 and 311 (see below)
 
-    adapter = qwen4_exp.Qwen4ExpGGUFAdapter()
-    weights = [("model.language_model.per_layer_token_embd.weight", object())]
-    config = SimpleNamespace(
+
+def _ple_transform_config(**overrides):
+    base = {
+        "ple_layer_ids": [2],
+        "split_ngram_parts": 3,
+        "ngram_size": 2,
+        "heads_per_ngram": 2,
+        "ngram_vocab_size_base": 300,
+        "make_ngram_vocab_size_divisible_by": 1,
+        "ple_embed_dim": 320,
+    }
+    base.update(overrides)
+    return SimpleNamespace(
+        dtype=torch.bfloat16,
         hf_config=SimpleNamespace(
-            get_text_config=lambda: SimpleNamespace(
-                linear_num_key_heads=0,
-                linear_num_value_heads=0,
-            )
+            get_text_config=lambda: SimpleNamespace(**base)
+        ),
+    )
+
+
+def test_qwen4_exp_synthentic_ple_vocab_matches_nightly_layout():
+    """The synthetic config's padded vocab must equal the nightly's layout."""
+    from vllm_gguf_plugin.weights_adapter import qwen4_exp
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding
+
+    _, _, total = Qwen4ExpNGramEmbedding._make_vocab_layout(
+        ngram_vocab_size_base=300, ngram_heads=2, ple_dense_layer_id=0
+    )
+    assert total == _PLE_TEST_ROWS
+    assert qwen4_exp._padded_ngram_vocab_size(
+        SimpleNamespace(
+            ngram_size=2,
+            heads_per_ngram=2,
+            ngram_vocab_size_base=300,
+            make_ngram_vocab_size_divisible_by=1,
+        )
+    ) == _PLE_TEST_ROWS
+
+
+def _ple_weights(row_count: int, include_companion: bool = True):
+    weight = torch.randint(0, 256, (row_count * 90,), dtype=torch.uint8)
+    weights = []
+    if include_companion:
+        # The iterator yields the synthetic weight_type companion first.
+        weights.append(
+            ("model.language_model.per_layer_token_embd.weight_type", torch.tensor(20))
+        )
+    weights.append(("model.language_model.per_layer_token_embd.weight", weight))
+    return weights
+
+
+def test_qwen4_exp_streams_ple_shards_zero_copy_and_byte_exact():
+    from vllm_gguf_plugin.weights_adapter.qwen4_exp import Qwen4ExpGGUFAdapter
+
+    rows = _PLE_TEST_ROWS
+    weights = _ple_weights(rows)
+
+    out = list(Qwen4ExpGGUFAdapter().transform_weights(weights, _ple_transform_config()))
+
+    assert [name for name, _ in out] == [
+        f"model.language_model.layers.1.ple.ple_embedding."
+        f"ngram_embedding.shard_{i}.weight"
+        for i in range(3)
+    ]
+    tensors = [tensor for _, tensor in out]
+    assert all(tensor.dtype == torch.uint8 for tensor in tensors)
+    assert [tuple(tensor.shape) for tensor in tensors] == [
+        (206, 90),
+        (206, 90),
+        (206, 90),
+    ]
+    # Byte-exact: the shards concatenate back to the source table.
+    assert torch.cat(tensors).reshape(-1).equal(weights[1][1])
+    # Zero-copy: every shard aliases the source's memory map.
+    base_ptr = weights[1][1].data_ptr()
+    end_ptr = base_ptr + weights[1][1].numel()
+    for tensor in tensors:
+        assert base_ptr <= tensor.data_ptr() < end_ptr
+    # The weight_type companion is not yielded.
+    assert not any(name.endswith(".weight_type") for name, _ in out)
+
+
+def test_qwen4_exp_ple_shards_have_uneven_and_empty_tail():
+    from vllm_gguf_plugin.weights_adapter.qwen4_exp import Qwen4ExpGGUFAdapter
+
+    # R = 5 + 7 = 12 (base 4), parts = 5 -> shard_size 3 -> [3,3,3,3,0]:
+    # an uneven last shard would be impossible here, so also cover the
+    # uneven case separately below.
+    rows = 12
+    weights = _ple_weights(rows, include_companion=False)
+
+    out = list(
+        Qwen4ExpGGUFAdapter().transform_weights(
+            weights, _ple_transform_config(ngram_vocab_size_base=4, split_ngram_parts=5)
         )
     )
 
-    with pytest.raises(NotImplementedError, match="packed PLE table"):
-        list(adapter.transform_weights(weights, config))
+    assert [name for name, _ in out] == [
+        f"model.language_model.layers.1.ple.ple_embedding."
+        f"ngram_embedding.shard_{i}.weight"
+        for i in range(5)
+    ]
+    shapes = [tuple(tensor.shape) for _, tensor in out]
+    assert shapes == [(3, 90), (3, 90), (3, 90), (3, 90), (0, 90)]
+    assert all(tensor.dtype == torch.uint8 for _, tensor in out)
+    assert torch.cat([tensor for _, tensor in out]).reshape(-1).equal(weights[0][1])
+
+    # Uneven tail: R = 618, parts = 5 -> shard_size 124 -> [124,124,124,124,122].
+    weights = _ple_weights(_PLE_TEST_ROWS, include_companion=False)
+    out = list(
+        Qwen4ExpGGUFAdapter().transform_weights(
+            weights, _ple_transform_config(split_ngram_parts=5)
+        )
+    )
+    shapes = [tuple(tensor.shape) for _, tensor in out]
+    assert shapes == [(124, 90)] * 4 + [(122, 90)]
+    assert torch.cat([tensor for _, tensor in out]).reshape(-1).equal(weights[0][1])
+
+
+def test_qwen4_exp_ple_shard_names_match_the_nightly_split():
+    """Row counts must mirror the nightly load_weights shard math."""
+    from vllm_gguf_plugin.weights_adapter.qwen4_exp import Qwen4ExpGGUFAdapter
+
+    rows = _PLE_TEST_ROWS
+    parts = 7
+    weights = _ple_weights(rows, include_companion=False)
+    out = list(
+        Qwen4ExpGGUFAdapter().transform_weights(
+            weights, _ple_transform_config(split_ngram_parts=parts)
+        )
+    )
+    shard_size = (rows + parts - 1) // parts
+    expected_rows = [
+        max(0, min(shard_size, rows - i * shard_size)) for i in range(parts)
+    ]
+    assert expected_rows == [89, 89, 89, 89, 89, 89, 84]
+    assert [tuple(tensor.shape)[0] for _, tensor in out] == expected_rows
+
+
+def test_qwen4_exp_rejects_ple_row_count_mismatch():
+    from vllm_gguf_plugin.weights_adapter.qwen4_exp import Qwen4ExpGGUFAdapter
+
+    adapter = Qwen4ExpGGUFAdapter()
+    for bad_rows in (_PLE_TEST_ROWS + 1, _PLE_TEST_ROWS - 1):
+        weights = _ple_weights(bad_rows, include_companion=False)
+        with pytest.raises(ValueError, match=str(_PLE_TEST_ROWS)):
+            list(adapter.transform_weights(weights, _ple_transform_config()))
+
+
+def test_qwen4_exp_rejects_ple_payload_with_bad_byte_length():
+    from vllm_gguf_plugin.weights_adapter.qwen4_exp import Qwen4ExpGGUFAdapter
+
+    weight = torch.randint(
+        0, 256, (_PLE_TEST_ROWS * 90 + 7,), dtype=torch.uint8
+    )
+    weights = [("model.language_model.per_layer_token_embd.weight", weight)]
+
+    with pytest.raises(ValueError, match=str(_PLE_TEST_ROWS * 90)):
+        list(Qwen4ExpGGUFAdapter().transform_weights(weights, _ple_transform_config()))
 
 
 def _transform_config():
