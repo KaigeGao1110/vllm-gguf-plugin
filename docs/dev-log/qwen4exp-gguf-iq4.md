@@ -209,6 +209,269 @@ for community support.
   GPU before review; a green CPU run here said nothing about whether the kernel
   compiled.
 
+### 2026-09-11 — Plugin GPU baseline on the PRO 6000
+
+- Kernel tests restricted to the checkpoint's formats (IQ3_S, IQ4_NL, IQ4_XS,
+  Q8_0, Q6_K) at `93490c8`: 168 passed, 0 failed, 144 skipped. Every skip is
+  `tests/test_kernels.py:258: Current CUDA Kernel hasn't supported invarlen`.
+  Evidence: box log `gpu-kernels-model-types-93490c8.log`.
+- Full plugin suite on the GPU at `93490c8` (generation, multimodal and diffusion
+  tests excluded; the two sample repos downloaded): 1543 passed, 68 failed,
+  576 skipped in 35 min. Evidence: box log `gpu-plugin-baseline-93490c8.log`.
+- All 68 failures are `test_moe[<quant>-dtype2-<top_k>-512-<num_tokens>]`, where
+  `dtype2` is `torch.float32` and `num_tokens` is 7 or 2048, across 17 quant
+  types (including Q8_0, IQ4_NL, IQ3_S and IQ4_XS). Every one fails at
+  `tests/test_kernels.py:358`, inside vLLM's unquantized reference
+  `fused_experts`, with `triton.runtime.errors.OutOfResources: out of resource:
+  shared memory, Required: 122880 | 131072, Hardware limit: 101376`. The plugin's
+  own `_fused_moe_gguf` call on the line above completed. The float16 and
+  bfloat16 variants of the same tests pass.
+- Assessment: this is a test-reference problem on this GPU (the default float32
+  fused-MoE Triton config exceeds its per-kernel SRAM limit), not a plugin
+  kernel defect, and the model runs in bfloat16. For the PR, the float32
+  reference path in `test_moe` should use a smaller reference config or a
+  dequantize-and-loop reference; not changed yet.
+- Separately, `test_register_sets_engine_args_for_gguf_model` fails on upstream
+  main as well (`HFValidationError` for `/tmp/model.gguf`). Cause: the CPU
+  runner sets `HF_HUB_OFFLINE=1`, and nightly `EngineArgs.__post_init__`
+  (`arg_utils.py:831-838`) passes every non-existent model path to
+  `get_model_path`, which treats it as an HF repo id. The test's path does not
+  exist, so it fails before the plugin's `create_model_config` patch runs. Local
+  GGUF files that exist are unaffected, but an offline remote `repo:quant`
+  reference fails at the same step: a real plugin gap. To fix in the PR batch
+  (leave GGUF references to the plugin loader in offline mode, and make the test
+  independent of `HF_HUB_OFFLINE`).
+
+### 2026-09-11 — P3 full load, run 1: hyper-connection companion names
+
+- Command (plugin tree `2e9faa2`, box script `p3-serve.sh`): `vllm serve
+  <first shard> --tokenizer <config> --hf-config-path <config>
+  --language-model-only --engram-config '{"cpu_offload": true}' --host 127.0.0.1
+  --max-model-len 32768 --max-num-seqs 8 --gpu-memory-utilization 0.90
+  --enforce-eager`. The plugin registered its loader and config parser, vLLM
+  resolved `EngramConfig(cpu_offload=True)`, and the PLE layer initialised with
+  `quantization_method=Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod, weight_dtype=uint8,
+  weight_device=cpu, pinned=True`.
+- Weight loading then failed 12 s later (81 s after launch): `ValueError: There is no module or
+  parameter named 'hyper_connection_mixer.input_mix_weight_type_down' in
+  Qwen4ExpModel`.
+- Root cause: `gguf_quant_weights_iterator_multi` named the synthetic companion
+  with `name.replace("weight", "weight_type")`, rewriting every occurrence. The
+  HC projections are `input_mix_weight_{down,up}.weight`, so the companion became
+  `input_mix_weight_type_down.weight_type`. The adapter's `.weight_type` check
+  never matched, so the 194 Q8_0 HC projections were neither recognised nor
+  decoded. The P2 unit test hand-built the correct companion name, so it could
+  not see the defect. The diffusion iterator had the same expression.
+- Fix `db2d8b2`: `gguf_weight_type_name()` replaces only the last `weight`, used
+  by both iterators; names with a single `weight` are unchanged (no other adapter
+  maps a name with two). New `tests/test_weight_type_names.py` drives the real
+  iterator, with a wiring guard feeding its output straight into the Qwen4Exp
+  adapter. RED on the unfixed tree reproduced the exact load-time name; GREEN on
+  the box: 124 passed, 1 skipped across the new tests, the Qwen4Exp adapter, the
+  zero-copy iterator, diffusion, and both PLE suites; repo-wide ruff 0.14.0
+  check and format clean.
+
+### 2026-09-11 — P3 full load, run 2: the concatenated indexer projection
+
+- Run 2 (plugin tree with `db2d8b2`) got past every per-tensor weight and failed
+  at the very end of `transform_weights`: `AssertionError: Tried to load weights
+  of size torch.Size([640, 2560]) to a parameter of size torch.Size([0])` in
+  `ReplicatedLinear.weight_loader` (`linear.py:399`).
+- The tensor is the adapter's own `index_qk_proj`: BF16 indexer q
+  `[512, 2560]` concatenated with k `[128, 2560]`, yielded after the main loop.
+  The module is a `ReplicatedLinear` built with the model's quant config.
+- Root cause: the loader derives unquantized modules from GGUF tensor names
+  (`...self_attn.indexer.q_proj` and `k_proj`), and the quant config matches
+  them by substring against the vLLM prefix, so `index_qk_proj` got
+  `GGUFLinearMethod`. That method creates an uninitialised weight and relies on
+  the layer's `weight_loader_v2`; `ReplicatedLinear` has none, so loading fell
+  through to the plain loader's size assertion. F32 `ReplicatedLinear`s such as
+  `mlp.gate` were unaffected because their GGUF names map to their own modules.
+- Fix `39efe53`: the adapter declares
+  `extra_unquantized_modules = ("self_attn.indexer.index_qk_proj",)`;
+  `transform_weights` already rejects quantized indexer q/k. The regression test
+  maps the declaration through `Qwen4ExpForConditionalGeneration`'s real rename
+  mapper and checks the vLLM prefix is skipped while `o_proj` and the shared
+  expert are not. RED on the `db2d8b2` tree (`is_layer_skipped_gguf(..., [])`
+  was `False`); GREEN: 125 passed, 1 skipped; ruff clean.
+- Left for the PR: any genuinely quantized `ReplicatedLinear` would hit the same
+  missing-v2-loader path in `GGUFLinearMethod`. Not reachable with this
+  checkpoint.
+
+### 2026-09-11 — P3 full load, run 3: weights load; profile run fails in MoE
+
+- Run 3 (plugin tree with `39efe53`): `Model loading took 61.84 GiB memory and
+  115.6 seconds`. Memory sampler: GPU about 65 GB, host `Shmem` 32 GB (the
+  pinned PLE table), `MemAvailable` 85 GB of 123 GB.
+- Eleven seconds later the profile run (`max_num_batched_tokens=8192`,
+  `max_num_seqs=8`, eager) failed inside the plugin's GGUF MoE kernel:
+  `_fused_moe_gguf` → `ops.ggml_moe_a8_vec` → `RuntimeError: CUDA error: invalid
+  argument`, raised from `CUDACachingAllocator::alloc_block`.
+- The checkpoint's routed experts are IQ3_S (gate/up; IQ4_XS in layer 2) and
+  IQ4_NL or Q8_0 (down). IQ types are not in `MMQ_QUANT_TYPES`, so every batch
+  size takes the per-row `ggml_moe_a8_vec` path, and the kernels launch with
+  grid `z = tokens * top_k` (81,920 rows for this profile batch).
+- Isolated reproduction on the same GPU (`.dev/p3/moe_vec_repro.py`, one process
+  per size, `CUDA_LAUNCH_BLOCKING=1`, 512 experts, hidden 2560, top-k 10, int32
+  ids): both calls, IQ3_S w13 and IQ4_NL w2, succeed at 64, 2048, 6553, 6554 and
+  8192 tokens. So neither the token count nor the grid size alone reproduces
+  it. vLLM's default `fused_topk` returns int32 ids, as the kernel expects.
+- Because CUDA reports launch errors asynchronously, the allocator is only where
+  the error surfaced. Run 4 repeats the load with `CUDA_LAUNCH_BLOCKING=1` to
+  find the failing call.
+- Correction (see the next entry): this reproduction was wrong. It allocated
+  every tensor before the launch and never checked the outputs, so a launch
+  that never ran looked like a success.
+
+### 2026-09-11 — P3 runs 4 and 5: the CUDA grid z limit
+
+- Run 4 (`CUDA_LAUNCH_BLOCKING=1`) failed identically, in the allocator of the
+  same `ggml_moe_a8_vec` call. Blocking launches did not move the report, which
+  already pointed at a launch that had not run rather than at a faulting kernel.
+- Run 5 used a box-only tree that printed the arguments of the failing call:
+  `X=(81920, 640) bfloat16`, `W=(512, 2560, 360) uint8`, `ids=(8192, 10) int32`,
+  `top_k=1`, `type=20` (IQ4_NL), `row=2560`, `tokens=81920`. This is the down
+  projection: one row per routed pair, with the top-k ids passed unchanged and
+  `top_k=1`.
+- The `moe_vec_*` kernels launch with `dim3 block_nums(block_num_y, 1,
+  tokens * top_k)`. CUDA caps the grid's y and z extents at 65,535, so both the
+  gate/up call (8,192 × 10) and the down call (81,920 × 1) exceed it. The launch
+  is rejected, and the error is only returned by the next CUDA call, here the
+  allocation of the output tensor for the following step.
+- Second reproduction (`.dev/p3/moe_vec_repro2.py`, evidence
+  `.dev/evidence/q4gguf-p3-moe-vec-grid-z-repro2-20260911.log`): after each
+  launch, allocate a new tensor and synchronize. With 512 experts, hidden 2560
+  and top-k 10, both calls pass at 2,048 and 6,553 tokens (z = 65,530) and fail
+  at 6,554 (z = 65,540) and 8,192 with `alloc_after_launch=FAIL CUDA error:
+  invalid argument`. The boundary is exactly the grid limit.
+- The same script compared one launch against launches of at most
+  `32768 // top_k` tokens. Its first comparison reported every row different:
+  random IQ bytes decode to NaN and infinity, and `NaN != NaN`. With a NaN-aware
+  comparison both calls match exactly (0 differing rows at 2,048 and 6,553
+  tokens; finite fractions 0.727 for IQ3_S and 0.530 for IQ4_NL).
+- The other launch sites were checked. `mmvq.cuh` launches with
+  `block_nums(block_num_y, nvecs, 1)` and would hit the y limit, but the dense
+  linear method uses it only for at most 8 or 16 rows. `mmq.cuh` divides every
+  grid extent by its block size.
+- Fix `32a1662`: `ops.ggml_moe_a8_vec` splits calls above `65535 // top_k`
+  tokens into launches under the limit and concatenates the outputs. The kernel
+  reads ids as a flat array indexed by row, so ids are sliced flat, which covers
+  the down call's `(tokens, 10)` ids with `top_k=1`. Calls under the limit keep
+  the single launch. A C++ fix that loops over launches inside the kernel would
+  avoid the Python loop; the same launch exists in vLLM's in-tree GGUF kernel,
+  so that belongs in the PR.
+- New test `tests/test_moe_vec_grid_limit.py` covers both call shapes with Q8_0
+  experts, forces an allocation after the call, and compares the result against
+  direct launches of at most 4,096 rows. RED on the PRO 6000 with the unfixed
+  tree: both cases failed with `CUDA error: invalid argument` at that allocation.
+  GREEN with the fix, together with the adapter and companion-name suites:
+  42 passed. Repository-wide ruff 0.14.0 check and format are clean.
+
+### 2026-09-11 — P3 runs 6 and 7: an illegal memory access in the same kernel
+
+- Run 6 (tree with `32a1662`): weights loaded in 94 s (61.84 GiB). The grid
+  error is gone, but six seconds later the profile run failed with `CUDA error:
+  an illegal memory access was encountered`, reported at `shared_output +
+  fused_output` in vLLM's MoE runner. That report is asynchronous.
+- Run 7 repeated it with `CUDA_LAUNCH_BLOCKING=1`. The error now surfaces inside
+  the gate/up call `ops.ggml_moe_a8_vec(x, w1, ...)`, at the chunked kernel call,
+  in the fill of the output tensor (`new_zeros`, `FillFunctor<BFloat16>`). The
+  custom kernels do not check their launches, so the fault belongs to the
+  previous unchecked launch: the first chunk's `moe_vec` or `quantize_row_q8_1`
+  kernel. Before the fix that launch was rejected and never ran, so this fault
+  was hidden behind the grid error.
+- The routed-expert types are consistent within every layer (`gguf` reader over
+  all shards): gate and up are IQ3_S in every layer except layer 2 (IQ4_XS);
+  down is IQ4_NL except layers 2, 4, 30, 46 and 47 (Q8_0). A gate/up type
+  mismatch reading past the packed tensor is therefore ruled out.
+- The kernel's indices stay far inside 32-bit range for these shapes (largest is
+  `blockIdx.z * nrows` ≈ 84 M), and IQ3_S, IQ4_XS and IQ4_NL decode through
+  fixed-size codebooks, so bad weight bytes cannot index out of bounds. The
+  remaining candidates are an expert id outside `[0, 512)` and a stride or
+  layout the kernel does not expect.
+- Run 8 uses a box-only debug tree (`.dev/p3/moe_dbg_patch.py`, never
+  committed). It synchronizes before and after every per-row call with more than
+  64 tokens and prints shapes, strides, id range and quant type.
+
+### 2026-09-11 — P3 runs 8 and 9: padding tokens carry expert id -1
+
+- Run 8 printed the first call before it faulted: `X=(8192, 2560) bfloat16`,
+  `W=(512, 1280, 1100) uint8` (contiguous), `ids=(8192, 10) int32`, `type=21`
+  (IQ3_S), and `idmin=-1 idmax=-1`. Every expert id was -1. The kernel computes
+  the expert's weight offset as `expert * nrows * blocks_per_row`, so it read
+  the bytes before the expert tensor.
+- `fused_topk` itself never returns -1 on the same GPU, whatever its input: finite,
+  NaN, positive and negative infinity (float32 and bfloat16, 8,192 tokens), and
+  unprojected 2,560-wide hidden states (ids up to 2,559). The `other=-1` in
+  `base_router.py` belongs to the EPLB logical-to-physical map, which is off.
+- Run 9 (`.dev/p3/moe_dbg_patch2.py`) traced the router: `FusedTopKRouter`,
+  no EPLB, finite bfloat16 logits (largest magnitude 8.9), and still `idmin=-1
+  idmax=-1` on return.
+- The cause is in the router's call: `vllm_topk_softmax` passes
+  `is_padding=_get_padding_mask(...)`, and `VLLM_MOE_SKIP_PADDING` defaults to
+  on. The GPU model runner marks padding tokens in its input batch, the kernel
+  writes id -1 for them, and vLLM's own MoE kernels skip such slots. A profile
+  run consists only of padding tokens, so every id was -1; in serving, any
+  padded batch would reach the same fault.
+- Fix `e1e120f`: `_fused_moe_gguf` sends empty slots to expert 0 with zero
+  weight (`clamp(min=0)` and `masked_fill`), out of place and without a host
+  sync, so all three paths (per-row, grouped, slow fallback) are covered and the
+  caller's routing tensors stay unchanged.
+- New test `tests/test_moe_padding_ids.py`: Q8_0 experts at 16 tokens (per-row
+  path) and 128 tokens (grouped path), with half the tokens fully padded and one
+  single empty slot. Padded rows must be exactly zero, the other rows must match
+  the same batch routed with valid ids and the empty slot's weight set to zero,
+  and the caller's ids and weights must be unchanged. RED on the PRO 6000 with
+  the previous tree: `CUDA error: an illegal memory access was encountered`.
+  GREEN with the fix, together with the grid-limit, adapter and companion-name
+  suites: 44 passed. Repository-wide ruff 0.14.0 check and format are clean.
+- Run 10 (tree with `e1e120f`): weights loaded in 91 s (61.84 GiB) and the
+  profile run passed. `Available KV cache memory: 21.55 GiB`, `GPU KV cache size:
+  635,699 tokens`, maximum concurrency 19.40x at 32,768 tokens per request. The
+  engine then failed in kernel warm-up, not in the model: FlashInfer JIT-compiles
+  its sampling kernels on first use, and the box's `/usr/local/cuda/include` has
+  no cuRAND headers (`sampling.cuh:20: fatal error: curand.h: No such file or
+  directory`; the venv's `nvidia/cu13/include` does have one). This is a gap in
+  the rented environment. Run 11 sets `VLLM_USE_FLASHINFER_SAMPLER=0`, which the
+  GPU sampler honours through `flashinfer_sampler_supported()`, and falls back to
+  the PyTorch top-k/top-p sampler; greedy requests never use FlashInfer sampling.
+- Run 11 is the first generation on the PRO 6000; see the next entry.
+- Monitoring note: the background monitors for runs 6 and 7 never reported,
+  because the Mac shell (zsh) does not split an unquoted `$SSH`, so every poll
+  failed and was retried silently. Later monitors call ssh through a function
+  and fail loudly after repeated connection errors.
+
+### 2026-09-11 — P3 run 11: first generation on the PRO 6000
+
+- Tree with `e1e120f`, `VLLM_USE_FLASHINFER_SAMPLER=0`, eager mode,
+  `--max-model-len 32768 --max-num-seqs 8 --gpu-memory-utilization 0.90`, PLE
+  table in pinned host memory (`--engram-config '{"cpu_offload": true}'`).
+- Startup: weights loaded in 83.6 s (61.84 GiB); profile, KV cache and warm-up
+  took 28.2 s; the API was ready 2 min 9 s after launch.
+- Memory: KV cache 21.55 GiB, 635,699 tokens (19.4 concurrent 32,768-token
+  requests). GPU 89.1 GB in use. Host: 32 GB shared memory (the pinned PLE
+  table), engine RSS 34 GB, 84 GB still available.
+- Correctness, greedy with thinking off:
+  - a short Chinese prompt returned `我是通义千问，17 乘以 23 等于 391。`
+    (correct product);
+  - a 13,847-token prompt with an access code buried in filler returned `7342`;
+  - a 512-token Chinese expository answer was coherent and on topic.
+- Speed (evidence `logs/p3-requests-run11*.log`, `logs/p3-concurrency-run11.log`
+  on the box):
+  - short prompt: first token 0.25 s cold, 0.10 s warm;
+  - 13,847-token prompt: first token 16.97 s cold, because vLLM JIT-compiled two
+    Triton kernels (`_fused_post_conv_kernel`, `_qsa_pre_indexer_kernel`) during
+    that first request and warned about it; 1.62 s warm, about 8,500 prompt
+    tokens per second;
+  - decode: 30.0 tokens per second for a single 512-token answer;
+  - 256-token answers at concurrency 1, 4 and 8: 30.2, 106.8 and 226.5 tokens per
+    second in aggregate (30.2, 26.7 and 28.3 per request). Throughput scales
+    almost linearly and the GPU showed 62% utilisation at concurrency 8, which
+    points at per-step host overhead in eager mode rather than at the kernels.
+- Run 12 drops `--enforce-eager` (torch.compile and CUDA graphs) and raises
+  `--max-num-seqs` to 32 to test whether the plugin's custom ops survive graph
+  capture and how far throughput moves.
+
 ## Design decisions
 
 ### D1 — Implement IQ4_NL as a Level-3 PLE embedding method, not a worker
@@ -255,13 +518,14 @@ then copies each shard into the method's storage. No step may allocate the
   (digest `sha256:96b234afa2867031ad0a226b149a06483861e613e3a3083da53398d347b5ffbd`),
   #56273 files overlaid read-only, network disabled, CPU and memory limited,
   containers removed on exit.
-- GPU tests and full load: one RTX PRO 6000 WE. Pending machine availability.
+- GPU tests and full load: one RTX PRO 6000 WE (vast.ai), venv on nightly
+  `0.28.1rc1.dev628+g2a02f6efe` with #56273 overlaid; see the 2026-09-11 entries.
 
 ## Work packages
 
 | ID | Scope | State |
 |---|---|---|
 | P0 | Base pin, test environment, contracts, this log | done |
-| P1 | IQ4_NL PLE embedding method, Triton lookup kernel, `from_quant_config` hook | in progress |
+| P1 | IQ4_NL PLE embedding method, Triton lookup kernel, `from_quant_config` hook | accepted after Core kernel repair, merged `2e9faa2`; 32 passed on GPU |
 | P2 | Port the `qwen4_exp` adapter to nightly and stream PLE shards | accepted, merged `4a99ed1`; real-checkpoint check passed |
-| P3 | Full download, full load, GPU kernel tests, generation, quality and performance | environment and checkpoint ready; waiting for P1 and P2 |
+| P3 | Full download, full load, GPU kernel tests, generation, quality and performance | first generation on the PRO 6000 (run 11, eager) after fixes `db2d8b2`, `39efe53`, `32a1662`, `e1e120f`; graph mode in progress |
