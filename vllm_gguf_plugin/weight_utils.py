@@ -4,6 +4,7 @@ import glob
 import itertools
 import os
 import re
+import warnings
 from collections.abc import Generator, Iterable
 from pathlib import Path
 
@@ -157,15 +158,39 @@ def get_gguf_tensor_names(gguf_files: Iterable[str]) -> set[str]:
     }
 
 
+def _tensor_from_gguf_array(weight: np.ndarray, zero_copy: bool) -> torch.Tensor:
+    """Build a torch tensor from a GGUF payload array.
+
+    Declared zero-copy tensors share the memory-mapped payload via
+    ``torch.from_numpy`` (suppression only covers the non-writable-array
+    warning emitted for the read-only mmap); every other tensor keeps the
+    historical private ``torch.tensor`` copy.
+    """
+    if not zero_copy:
+        return torch.tensor(weight)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"The given NumPy array is not writable",
+            category=UserWarning,
+        )
+        return torch.from_numpy(weight)
+
+
 def gguf_quant_weights_iterator(
-    gguf_file: str | Path, gguf_to_hf_name_map: dict[str, str] | None
+    gguf_file: str | Path,
+    gguf_to_hf_name_map: dict[str, str] | None = None,
+    zero_copy_tensor_names: frozenset[str] = frozenset(),
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    yield from gguf_quant_weights_iterator_multi([gguf_file], gguf_to_hf_name_map)
+    yield from gguf_quant_weights_iterator_multi(
+        [gguf_file], gguf_to_hf_name_map, zero_copy_tensor_names
+    )
 
 
 def gguf_quant_weights_iterator_multi(
     gguf_files: list[str],
     gguf_to_hf_name_map: dict[str, str] | None = None,
+    zero_copy_tensor_names: frozenset[str] = frozenset(),
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield ``(name, tensor)`` for all tensors in *gguf_files*.
 
@@ -173,6 +198,10 @@ def gguf_quant_weights_iterator_multi(
     directly (useful when a caller will apply a :class:`WeightsMapper`
     afterwards).  When a mapping is provided, tensors not present in the map
     are skipped and names are translated accordingly.
+
+    Tensors whose raw GGUF name is in *zero_copy_tensor_names* are yielded as
+    zero-copy ``torch.from_numpy`` views of the memory-mapped payload; all
+    other tensors are copied exactly as before.
     """
     _QUANT_TYPES = ("F32", "BF16", "F16")
 
@@ -186,6 +215,7 @@ def gguf_quant_weights_iterator_multi(
             else:
                 name = tensor.name
 
+            zero_copy = tensor.name in zero_copy_tensor_names
             weight_type = tensor.tensor_type
             if weight_type.name not in _QUANT_TYPES:
                 yield name.replace("weight", "weight_type"), torch.tensor(weight_type)
@@ -195,9 +225,9 @@ def gguf_quant_weights_iterator_multi(
                 weight = weight.view(np.uint16)
                 if reader.byte_order == "S":
                     weight = weight.byteswap()
-                param = torch.tensor(weight).view(torch.bfloat16)
+                param = _tensor_from_gguf_array(weight, zero_copy).view(torch.bfloat16)
             else:
-                param = torch.tensor(weight)
+                param = _tensor_from_gguf_array(weight, zero_copy)
             yield name, param
 
 

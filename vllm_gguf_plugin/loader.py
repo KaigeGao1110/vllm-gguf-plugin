@@ -190,6 +190,7 @@ class GGUFModelLoader(BaseModelLoader):
         weights = gguf_quant_weights_iterator_multi(
             list(plan.files.all_files),
             plan.name_map,
+            zero_copy_tensor_names=frozenset(adapter.zero_copy_tensor_names),
         )
         return adapter.transform_weights(weights, model_config)
 

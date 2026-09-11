@@ -24,9 +24,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 QWEN4_EXP_MODEL_TYPES = ("qwen4_exp",)
-# The retained vLLM image exposes the Qwen4Exp config under the
-# qwen3_8_flash_next model package and uses this concrete architecture name.
-QWEN4_EXP_ARCHITECTURE = "Qwen3_8FlashNextForConditionalGeneration"
+# Official architecture name registered in the pinned nightly image's
+# ModelRegistry (vllm/models/qwen4_exp); the old qwen3_8_flash_next
+# stand-in name is no longer used.
+QWEN4_EXP_ARCHITECTURE = "Qwen4ExpForConditionalGeneration"
 
 _LAYER_SUBSTR = {
     # Gated delta-net / linear-attention names emitted by the pinned converter.
@@ -111,6 +112,21 @@ def _map_layer_name(name: str, backbone_prefix: str) -> str | None:
     return None
 
 
+def _find_gguf_tensor_type(
+    files: GGUFModelFiles, name: str
+) -> gguf.GGMLQuantizationType | None:
+    """Return the GGML type of *name* from the GGUF header, or ``None``.
+
+    Reading ``reader.tensors`` touches only the header and tensor index; no
+    payload bytes are read.
+    """
+    for path in files.backbone:
+        for tensor in gguf.GGUFReader(path).tensors:
+            if tensor.name == name:
+                return tensor.tensor_type
+    return None
+
+
 def _map_name(name: str, backbone_prefix: str, *, multimodal: bool) -> str | None:
     for source, target in _TOP_PREFIX.items():
         if name.startswith(source):
@@ -118,11 +134,163 @@ def _map_name(name: str, backbone_prefix: str, *, multimodal: bool) -> str | Non
                 return target + name[len(source) :]
             return backbone_prefix + target + name[len(source) :]
     if name == _PLE_PACKED_SUFFIX:
-        # This is intentionally a visible intermediate target.  The native
-        # Qwen4Exp loader has no GGUF IQ4_NL row-table hook in this plugin yet;
-        # transform_weights raises before an unsafe eager load can occur.
+        # Intentionally a visible intermediate target: the iterator hands the
+        # packed table to transform_weights, which expands it into the native
+        # ngram_embedding.shard_{i}.weight shards.
         return backbone_prefix + "per_layer_token_embd.weight"
     return _map_layer_name(name, backbone_prefix)
+
+
+def _is_prime64(value: int) -> bool:
+    """Deterministic Miller-Rabin primality test for 64-bit integers.
+
+    Mirrors ``Qwen4ExpNGramEmbedding._is_prime_64`` in the pinned nightly
+    image (vllm/models/qwen4_exp), which derives the per-head n-gram
+    vocabulary sizes; the plugin must stay in sync with it.
+    """
+    if value < 2:
+        return False
+    for prime in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if value % prime == 0:
+            return value == prime
+    exponent = value - 1
+    shifts = 0
+    while exponent % 2 == 0:
+        exponent //= 2
+        shifts += 1
+    for base in (2, 325, 9375, 28178, 450775, 9780504, 1795265022):
+        if base % value == 0:
+            continue
+        witness = pow(base, exponent, value)
+        if witness in (1, value - 1):
+            continue
+        for _ in range(shifts - 1):
+            witness = (witness * witness) % value
+            if witness == value - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def _nth_prime_after(start: int, count: int) -> int:
+    """The ``count``-th prime strictly greater than *start*.
+
+    Mirrors ``Qwen4ExpNGramEmbedding._nth_prime_after`` in the pinned nightly
+    image.
+    """
+    prime = int(start)
+    for _ in range(count):
+        candidate = prime + 1
+        if candidate <= 2:
+            prime = 2
+            continue
+        if candidate % 2 == 0:
+            candidate += 1
+        while not _is_prime64(candidate):
+            candidate += 2
+        prime = candidate
+    return prime
+
+
+def _padded_ngram_vocab_size(text_config, ple_dense_layer_id: int = 0) -> int:
+    """Total padded n-gram vocabulary rows the native loader allocates.
+
+    Mirrors ``Qwen4ExpNGramEmbedding.__init__`` in the pinned nightly image:
+    one prime-sized block per n-gram head (``ngram_heads`` of them for this
+    PLE layer's dense id), padded to a multiple of
+    ``make_ngram_vocab_size_divisible_by``.  The GGUF PLE table must have
+    exactly this many rows.
+    """
+    ngram_heads = (int(text_config.ngram_size) - 1) * int(text_config.heads_per_ngram)
+    base = int(text_config.ngram_vocab_size_base)
+    total = sum(
+        _nth_prime_after(base - 1, ple_dense_layer_id * ngram_heads + head + 1)
+        for head in range(ngram_heads)
+    )
+    divisor = int(text_config.make_ngram_vocab_size_divisible_by)
+    return ((total + divisor - 1) // divisor) * divisor
+
+
+def _ngram_ple_prefix(text_config) -> str:
+    """Checkpoint prefix of one PLE layer's ngram embedding module.
+
+    ``ple_layer_ids`` entries are 1-based; the native decoder layer attaches
+    ``self.ple`` to the zero-based layer whose id+1 appears in the list.
+    The selected GGUF export carries a single packed PLE table, so exactly
+    one entry is qualified.
+    """
+    ple_layer_ids = [int(x) for x in text_config.ple_layer_ids]
+    if len(ple_layer_ids) != 1:
+        raise NotImplementedError(
+            "The selected GGUF export carries one packed PLE table, so a "
+            f"single ple_layer_ids entry is qualified, got {ple_layer_ids}"
+        )
+    layer_index = ple_layer_ids[0] - 1
+    return f"model.language_model.layers.{layer_index}.ple.ple_embedding."
+
+
+def _ngram_ple_shard_names(text_config) -> tuple[str, ...]:
+    """Native checkpoint names the PLE table expands to.
+
+    ``split_ngram_parts`` consecutive shards named exactly as the nightly
+    ``Qwen4ExpNGramEmbedding.load_weights`` accepts:
+    ``ngram_embedding.shard_{i}.weight`` for ``i`` in ``0..parts-1``.
+    """
+    prefix = _ngram_ple_prefix(text_config)
+    parts = int(text_config.split_ngram_parts)
+    if parts <= 0:
+        raise ValueError(f"split_ngram_parts must be positive, got {parts}")
+    return tuple(f"{prefix}ngram_embedding.shard_{i}.weight" for i in range(parts))
+
+
+def _ngram_ple_shard_weights(weight: torch.Tensor, text_config) -> Iterable[GGUFWeight]:
+    """Expand the packed IQ4_NL PLE table into native shard weights.
+
+    The table arrives as a zero-copy uint8 view of the GGUF payload: one
+    row of ``values_per_row // 32 * 18`` packed bytes per n-gram vocabulary
+    entry, in checkpoint row order.  It is split into
+    ``split_ngram_parts`` consecutive shards of ``ceil(R / parts)`` rows
+    (the last may be shorter; shards beyond the table are yielded with 0
+    rows, which the nightly ``Qwen4ExpNGramEmbedding.load_weights`` expects
+    and uses to mark the parameter loaded).  Every shard is a slice view of
+    the same memory map - nothing here copies the table.
+    """
+    if weight.dtype != torch.uint8:
+        raise ValueError(
+            f"The packed PLE table must arrive as raw uint8 bytes, got {weight.dtype}"
+        )
+    rows_total = _padded_ngram_vocab_size(text_config)
+    ngram_heads = (int(text_config.ngram_size) - 1) * int(text_config.heads_per_ngram)
+    values_per_row = int(text_config.ple_embed_dim) // ngram_heads
+    if values_per_row <= 0 or values_per_row % 32:
+        raise ValueError(
+            "A PLE row must hold a positive multiple of the IQ4_NL block "
+            f"size (32) values, got {values_per_row}"
+        )
+    bytes_per_row = values_per_row // 32 * 18
+    expected_bytes = rows_total * bytes_per_row
+    if weight.numel() != expected_bytes:
+        raise ValueError(
+            f"The packed PLE table has {weight.numel()} bytes; the config's "
+            f"padded n-gram vocabulary of {rows_total} rows of "
+            f"{bytes_per_row} packed bytes requires exactly {expected_bytes}"
+        )
+    flat = weight.reshape(-1)
+    prefix = _ngram_ple_prefix(text_config) + "ngram_embedding.shard_"
+    parts = int(text_config.split_ngram_parts)
+    if parts <= 0:
+        raise ValueError(f"split_ngram_parts must be positive, got {parts}")
+    shard_size = (rows_total + parts - 1) // parts
+    for i in range(parts):
+        start = i * shard_size
+        rows = max(0, min(shard_size, rows_total - start))
+        yield (
+            f"{prefix}{i}.weight",
+            flat[start * bytes_per_row : (start + rows) * bytes_per_row].view(
+                rows, bytes_per_row
+            ),
+        )
 
 
 class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
@@ -132,7 +300,13 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
     adds QSA, hyper-connections, and PLE tensors.  Inheriting the GDN layout
     declaration and restoration helpers keeps the V-head reorder tied to the
     existing, tested vLLM GGUF layout contract.
+
+    The packed PLE table is declared zero-copy: the iterator yields it as a
+    view of the memory-mapped GGUF payload so the 28.8 GB table is never
+    privately copied on the way to the native PLE loader.
     """
+
+    zero_copy_tensor_names = (_PLE_PACKED_SUFFIX,)
 
     @classmethod
     def matches(cls, config: PretrainedConfig) -> bool:
@@ -148,19 +322,32 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
         files: GGUFModelFiles,
         hf_config: PretrainedConfig,
     ) -> PretrainedConfig:
-        if getattr(hf_config.get_text_config(), "ple_layer_ids", []):
-            raise NotImplementedError(
-                "The GGUF CPU PLE worker is not wired into the native loader; "
-                "refusing model construction before any full PLE allocation. "
-                "Only configuration, mapping, and selected-row CPU probes are "
-                "qualified by this experimental adapter."
-            )
+        text_config = hf_config.get_text_config()
+        if getattr(text_config, "ple_layer_ids", []):
+            ple_type = _find_gguf_tensor_type(files, _PLE_PACKED_SUFFIX)
+            if ple_type is None:
+                raise NotImplementedError(
+                    "The config enables per-layer embeddings (ple_layer_ids) "
+                    f"but the GGUF contains no {_PLE_PACKED_SUFFIX} tensor; "
+                    "refusing to load without the packed PLE table."
+                )
+            if ple_type != gguf.GGMLQuantizationType.IQ4_NL:
+                raise NotImplementedError(
+                    f"Only the IQ4_NL packed PLE table has been qualified, "
+                    f"but {_PLE_PACKED_SUFFIX} is {ple_type.name}; refusing "
+                    "to expand the table."
+                )
         patched = maybe_patch_hf_config_from_gguf(
             files.primary_backbone,
             hf_config,
             mmproj_path=files.mm_proj,
         )
         patched.architectures = [QWEN4_EXP_ARCHITECTURE]
+        if getattr(text_config, "ple_layer_ids", []):
+            # Qwen4ExpNGramEmbedding selects its PLE embedding method from
+            # this marker; the adapter streams the IQ4_NL rows still packed,
+            # so no step allocates the expanded table.
+            text_config.ple_embedding_dtype = "gguf_iq4_nl"
         return patched
 
     def build_name_map(
@@ -208,12 +395,14 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
             quantized_types: dict[str, int] = {}
             indexer_parts: dict[str, dict[str, torch.Tensor]] = {}
             for name, weight in weights:
+                if name.endswith(f"{_PLE_PACKED_SUFFIX}_type"):
+                    # The iterator synthesizes a weight_type companion for
+                    # every quantized tensor; the native PLE loader takes no
+                    # such tensor for the packed table.
+                    continue
                 if name.endswith(_PLE_PACKED_SUFFIX):
-                    raise NotImplementedError(
-                        "Qwen4Exp packed PLE table per_layer_token_embd.weight "
-                        "requires the bounded IQ4_NL row lookup loader; refusing "
-                        "to materialize or substitute the 102.4 GB BF16 table."
-                    )
+                    yield from _ngram_ple_shard_weights(weight, text_config)
+                    continue
                 if name.endswith(".weight_type"):
                     base = name.removesuffix(".weight_type")
                     quantized_bases.add(base)

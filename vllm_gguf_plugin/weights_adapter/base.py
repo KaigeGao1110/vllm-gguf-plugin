@@ -28,6 +28,12 @@ class BaseGGUFWeightsAdapter(ABC):
     #: model in speculative decoding) and must stay unquantized.
     extra_unquantized_modules: tuple[str, ...] = ()
 
+    #: Raw GGUF tensor names the weights iterator must yield as zero-copy
+    #: ``torch.from_numpy`` views of the memory-mapped GGUF payload instead of
+    #: private ``torch.tensor`` copies.  Empty by default: adapters opt in per
+    #: tensor, and every non-declared tensor keeps the copying behavior.
+    zero_copy_tensor_names: tuple[str, ...] = ()
+
     @classmethod
     @abstractmethod
     def matches(cls, config: PretrainedConfig) -> bool:
