@@ -767,13 +767,18 @@ for community support.
     CPU-offloaded PLE transfer is the bottleneck. Two concurrent readers each reached
     367 tok/s for an aggregate of 735 tok/s, so prefill is one fixed pipe that
     concurrency divides rather than a per-request penalty.
-    - Proposed change, to be applied in the containerisation window rather than its own
-    restart: `--max-num-batched-tokens 2048` (2.6 s per step) plus
+    - Proposed change: `--max-num-batched-tokens 2048` (2.6 s per step) plus
     `--long-prefill-token-threshold 1024`, which leaves half the budget for other
     callers so a short request joins the same step instead of waiting for a whole one.
     Aggregate prefill throughput is expected to fall by 1-2% from the extra per-step
     overhead; this is an estimate, and the change is to be reverted if a repeat of the
     42,064-token cold read drops below 750 tok/s.
+    - Order of application (Kaige, 2026-09-11): validate the pair on the containerised
+    engine on a second box first, then apply it to this server in one restart. The
+    validation must drive its own load — two concurrent 42,064-token cold reads plus a
+    four-token probe every two seconds — because the symptom only appears while a long
+    prefill occupies the step, and an otherwise idle server answers the probe in 0.4 s
+    even at 8192.
 - **Provenance of the running engine (2026-09-11, read-only).** The resident server
   gets the padding fix from `PYTHONPATH=/root/q4/plugin-padfix`, which shadows the
   editable install. The editable `.pth` resolves to a different tree,
