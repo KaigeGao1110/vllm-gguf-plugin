@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the packed IQ4_NL Qwen4Exp PLE embedding method."""
 
+import base64
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import gguf
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -188,3 +193,166 @@ def test_iq4_nl_ple_rejects_wrong_row_width(monkeypatch):
     )
     with pytest.raises(ValueError, match="Shape mismatch"):
         module.load_weights([(name, tensor[:, :-1])])
+
+
+# ---------------------------------------------------------------------------
+# CPU decode: method.embedding vs gguf's independent IQ4_NL decoder
+# ---------------------------------------------------------------------------
+
+_FIXTURE = Path(__file__).parent / "fixtures" / "qwen4_exp_iq4_nl_samples.json"
+
+
+def _reference_rows(packed: torch.Tensor) -> torch.Tensor:
+    """Decode packed rows with gguf's independent IQ4_NL decoder (FP32)."""
+    raw = np.ascontiguousarray(packed.numpy().copy())
+    reference = gguf.dequantize(raw, gguf.GGMLQuantizationType.IQ4_NL)
+    return torch.from_numpy(np.ascontiguousarray(reference)).reshape(-1, 160)
+
+
+def _load_fixture_rows() -> torch.Tensor:
+    fixture = json.loads(_FIXTURE.read_text())
+    raw = b"".join(
+        base64.b64decode(sample["packed_base64"]) for sample in fixture["samples"]
+    )
+    return torch.frombuffer(bytearray(raw), dtype=torch.uint8).reshape(-1, 90)
+
+
+def _make_packed_rows(scale_bits: list[int]) -> torch.Tensor:
+    """Deterministic packed rows with one controlled float16 scale per block."""
+    rows = np.zeros((len(scale_bits), 90), dtype=np.uint8)
+    for i, bits in enumerate(scale_bits):
+        for block in range(5):
+            rows[i, block * 18 : block * 18 + 2] = (bits & 0xFF, (bits >> 8) & 0xFF)
+            rows[i, block * 18 + 2 : block * 18 + 18] = np.arange(
+                block * 16, block * 16 + 16, dtype=np.uint8
+            )
+    return torch.from_numpy(rows.copy())
+
+
+def _make_single_rank_embedding(
+    monkeypatch, *, packed: torch.Tensor, params_dtype: torch.dtype
+):
+    """CPU device embedding holding the given packed rows on one ETP rank."""
+    _mock_etp_group(monkeypatch, world_size=1, rank=0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    with torch.device("cpu"):
+        embedding = Qwen4ExpPLEDeviceEmbedding(
+            packed.shape[0],
+            160,
+            params_dtype=params_dtype,
+            padding_size=2,
+            prefix="test.ple_embedding.ngram_embedding",
+            embedding_method=Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod(),
+            num_ngram_heads=2,
+            max_total_tokens=4,
+        )
+    # Full-table load goes through the parameter's (wrapped) loader, exactly
+    # as upstream load_weights does for shard rows.
+    embedding.weight.weight_loader(embedding.weight, packed)
+    embedding.embedding_method.process_weights_after_loading(embedding)
+    return embedding
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_embedding_cpu_matches_gguf_decoder_on_real_rows(monkeypatch, dtype):
+    packed = _load_fixture_rows()
+    reference = _reference_rows(packed)
+    layer = _make_single_rank_embedding(
+        monkeypatch, packed=packed, params_dtype=dtype
+    )
+    method = layer.embedding_method
+    ids = torch.tensor([[3, 0, 3], [7, 1, 5]], dtype=torch.int64)
+    actual = method.embedding(layer, ids)
+
+    assert actual.shape == (2, 3, 160)
+    assert actual.dtype == dtype
+    torch.testing.assert_close(
+        actual, reference[ids].to(dtype), rtol=0, atol=0
+    )
+
+
+def test_embedding_cpu_matches_gguf_decoder_on_1d_and_scalar_ids(monkeypatch):
+    packed = _load_fixture_rows()
+    reference = _reference_rows(packed)
+    layer = _make_single_rank_embedding(
+        monkeypatch, packed=packed, params_dtype=torch.float32
+    )
+    method = layer.embedding_method
+
+    flat_ids = torch.tensor([5, 2, 5, 0], dtype=torch.int64)
+    torch.testing.assert_close(
+        method.embedding(layer, flat_ids),
+        reference[flat_ids].float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        method.embedding(layer, torch.tensor(4, dtype=torch.int64)),
+        reference[4].float().reshape(160),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("scale_bits", "label"),
+    [
+        ([0xBF00], "negative"),
+        ([0x0000], "zero"),
+        ([0x0001], "subnormal"),
+        ([0x8001], "negative-subnormal"),
+        ([0x7BFF], "large"),
+        ([0x3C00, 0x0001, 0xBF00, 0x0000, 0x7BFF], "mixed"),
+    ],
+)
+def test_embedding_cpu_matches_gguf_decoder_on_special_scales(
+    monkeypatch, scale_bits, label
+):
+    packed = _make_packed_rows(scale_bits)
+    reference = _reference_rows(packed)
+    layer = _make_single_rank_embedding(
+        monkeypatch, packed=packed, params_dtype=torch.float32
+    )
+    method = layer.embedding_method
+    rows = len(scale_bits)
+    ids = torch.tensor(list(range(rows - 1, -1, -1)) + [0], dtype=torch.int64)
+    actual = method.embedding(layer, ids)
+
+    assert actual.shape == (rows + 1, 160)
+    torch.testing.assert_close(
+        actual, reference[ids].float(), rtol=0, atol=0, msg=label
+    )
+
+
+def test_embedding_cpu_empty_input_returns_empty(monkeypatch):
+    packed = _load_fixture_rows()
+    layer = _make_single_rank_embedding(
+        monkeypatch, packed=packed, params_dtype=torch.bfloat16
+    )
+    method = layer.embedding_method
+
+    actual = method.embedding(layer, torch.empty((0, 2), dtype=torch.int64))
+    assert actual.shape == (0, 2, 160)
+    assert actual.dtype == torch.bfloat16
+    assert (
+        method.embedding(layer, torch.empty((2, 0), dtype=torch.int64)).shape
+        == (2, 0, 160)
+    )
+
+
+def test_lookup_dtype_and_dequantize(monkeypatch):
+    packed = _load_fixture_rows()
+    layer = _make_single_rank_embedding(
+        monkeypatch, packed=packed, params_dtype=torch.bfloat16
+    )
+    method = layer.embedding_method
+    assert method.lookup_dtype(layer) == torch.bfloat16
+    values = torch.tensor([1.0, -2.0], dtype=torch.bfloat16)
+    converted = method.dequantize(layer, values, torch.float32)
+    assert converted.dtype == torch.float32
+    torch.testing.assert_close(converted, values.float(), rtol=0, atol=0)

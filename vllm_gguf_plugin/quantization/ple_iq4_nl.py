@@ -21,6 +21,8 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
 )
 
+from .ple_cpu import gather_iq4_nl_rows
+
 GGUF_IQ4_NL_PLE_DTYPE = "gguf_iq4_nl"
 
 _BLOCK_VALUES = 32
@@ -60,7 +62,7 @@ class Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         loaded_ranges = self._loaded_ranges
         tp_start = layer.shard_indices.org_vocab_start_index
         tp_end = layer.shard_indices.org_vocab_end_index
-        local_rows = sum(output_partition_sizes)
+        local_org_rows = tp_end - tp_start
 
         def wrapped_weight_loader(param, loaded_weight, *args, **kwargs):
             if loaded_weight.dtype != torch.uint8:
@@ -71,7 +73,9 @@ class Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
             original_weight_loader(param, loaded_weight, *args, **kwargs)
             checkpoint_start = kwargs.get("checkpoint_start")
             if checkpoint_start is None:
-                loaded_ranges.add((0, local_rows))
+                # A full checkpoint covers the whole original vocabulary; the
+                # padded tail rows of the last rank are never loaded.
+                loaded_ranges.add((0, local_org_rows))
                 return
             overlap = compute_ple_shard_overlap(
                 checkpoint_start=checkpoint_start,
@@ -117,6 +121,16 @@ class Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
 
     def lookup_dtype(self, layer: nn.Module) -> torch.dtype:
         return layer.params_dtype
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        if not input_.is_cuda:
+            return gather_iq4_nl_rows(
+                layer.weight,
+                input_,
+                layer.embedding_dim,
+                dtype=layer.params_dtype,
+            )
+        raise RuntimeError("CUDA IQ4_NL PLE lookup is not available")
 
     def dequantize(
         self,
