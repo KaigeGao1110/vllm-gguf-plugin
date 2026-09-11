@@ -11,7 +11,6 @@ from functools import wraps
 
 import torch
 from torch import nn
-
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )

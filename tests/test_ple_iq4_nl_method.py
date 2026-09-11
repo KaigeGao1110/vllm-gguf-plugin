@@ -10,10 +10,9 @@ import gguf
 import numpy as np
 import pytest
 import torch
-from torch import nn
-
 import vllm.model_executor.parameter as parameter_module
 import vllm.models.qwen4_exp.nvidia.ngram_embedding as ngram_embedding_module
+from torch import nn
 from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLEDeviceEmbedding,
@@ -100,10 +99,8 @@ def _mock_etp_group(monkeypatch, *, world_size=2, rank=0) -> None:
     )
 
 
-def _make_iq4_nl_ngram_embedding(
-    monkeypatch, *, rank=0, device="cpu", pinned=False
-):
-    """Build a device or pinned embedding holding 8 packed IQ4_NL rows in two ETP ranks."""
+def _make_iq4_nl_ngram_embedding(monkeypatch, *, rank=0, device="cpu", pinned=False):
+    """Build a device or pinned embedding with 8 packed IQ4_NL rows in two ETP ranks."""
     _mock_etp_group(monkeypatch, world_size=2, rank=rank)
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_rank", lambda: rank
@@ -111,7 +108,9 @@ def _make_iq4_nl_ngram_embedding(
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 2
     )
-    embedding_cls = Qwen4ExpPLEPinnedHostEmbedding if pinned else Qwen4ExpPLEDeviceEmbedding
+    embedding_cls = (
+        Qwen4ExpPLEPinnedHostEmbedding if pinned else Qwen4ExpPLEDeviceEmbedding
+    )
     with torch.device(device):
         embedding = embedding_cls(
             8,
@@ -126,15 +125,9 @@ def _make_iq4_nl_ngram_embedding(
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
     module.split_ngram_parts = 3
-    module.register_buffer(
-        "layer_multipliers", torch.zeros(1, dtype=torch.long)
-    )
-    module.register_buffer(
-        "ngram_heads_offsets", torch.zeros(1, dtype=torch.long)
-    )
-    module.register_buffer(
-        "ngram_heads_vocab_sizes", torch.zeros(1, dtype=torch.long)
-    )
+    module.register_buffer("layer_multipliers", torch.zeros(1, dtype=torch.long))
+    module.register_buffer("ngram_heads_offsets", torch.zeros(1, dtype=torch.long))
+    module.register_buffer("ngram_heads_vocab_sizes", torch.zeros(1, dtype=torch.long))
     module.ngram_embedding = embedding
     packed = torch.randint(0, 256, (8, 90), dtype=torch.uint8)
     # Deterministic finite float16 scales (1.0 + k/1024) in every block, so
@@ -154,9 +147,7 @@ def _make_iq4_nl_ngram_embedding(
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_iq4_nl_ple_loads_streamed_shards_across_etp_boundaries(
-    monkeypatch, rank
-):
+def test_iq4_nl_ple_loads_streamed_shards_across_etp_boundaries(monkeypatch, rank):
     module, tensors, packed = _make_iq4_nl_ngram_embedding(monkeypatch, rank=rank)
     loaded = set()
     for start in range(0, len(tensors), 2):
@@ -170,9 +161,7 @@ def test_iq4_nl_ple_loads_streamed_shards_across_etp_boundaries(
     torch.testing.assert_close(layer.weight, packed[rank * 4 :][:4])
 
 
-@pytest.mark.parametrize(
-    "missing", ["shard_0.weight", "shard_1.weight", "all"]
-)
+@pytest.mark.parametrize("missing", ["shard_0.weight", "shard_1.weight", "all"])
 def test_iq4_nl_ple_rejects_missing_local_shards(monkeypatch, missing):
     module, tensors, _ = _make_iq4_nl_ngram_embedding(monkeypatch)
     module.load_weights(
@@ -246,9 +235,7 @@ def _make_single_rank_embedding(
 ):
     """CPU device embedding holding the given packed rows on one ETP rank."""
     _mock_etp_group(monkeypatch, world_size=1, rank=0)
-    monkeypatch.setattr(
-        parameter_module, "get_tensor_model_parallel_rank", lambda: 0
-    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
     )
@@ -274,18 +261,14 @@ def _make_single_rank_embedding(
 def test_embedding_cpu_matches_gguf_decoder_on_real_rows(monkeypatch, dtype):
     packed = _load_fixture_rows()
     reference = _reference_rows(packed)
-    layer = _make_single_rank_embedding(
-        monkeypatch, packed=packed, params_dtype=dtype
-    )
+    layer = _make_single_rank_embedding(monkeypatch, packed=packed, params_dtype=dtype)
     method = layer.embedding_method
     ids = torch.tensor([[3, 0, 3], [7, 1, 5]], dtype=torch.int64)
     actual = method.embedding(layer, ids)
 
     assert actual.shape == (2, 3, 160)
     assert actual.dtype == dtype
-    torch.testing.assert_close(
-        actual, reference[ids].to(dtype), rtol=0, atol=0
-    )
+    torch.testing.assert_close(actual, reference[ids].to(dtype), rtol=0, atol=0)
 
 
 def test_embedding_cpu_matches_gguf_decoder_on_1d_and_scalar_ids(monkeypatch):
@@ -351,9 +334,10 @@ def test_embedding_cpu_empty_input_returns_empty(monkeypatch):
     actual = method.embedding(layer, torch.empty((0, 2), dtype=torch.int64))
     assert actual.shape == (0, 2, 160)
     assert actual.dtype == torch.bfloat16
-    assert (
-        method.embedding(layer, torch.empty((2, 0), dtype=torch.int64)).shape
-        == (2, 0, 160)
+    assert method.embedding(layer, torch.empty((2, 0), dtype=torch.int64)).shape == (
+        2,
+        0,
+        160,
     )
 
 
@@ -382,9 +366,7 @@ def test_register_patches_ple_from_quant_config():
     wrapper = _patched_from_quant_config()
     assert getattr(wrapper, "_vllm_gguf_plugin_iq4_nl_patched", False)
     assert isinstance(
-        wrapper(
-            None, "model.ngram_embedding", ple_iq4_nl.GGUF_IQ4_NL_PLE_DTYPE
-        ),
+        wrapper(None, "model.ngram_embedding", ple_iq4_nl.GGUF_IQ4_NL_PLE_DTYPE),
         Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod,
     )
 
@@ -446,9 +428,7 @@ def test_iq4_nl_kernel_scale_formula_matches_float16_bits():
     nan_mask = torch.isnan(reference)
     assert torch.any(nan_mask)
     assert torch.equal(torch.isnan(scale), nan_mask)
-    torch.testing.assert_close(
-        scale[~nan_mask], reference[~nan_mask], rtol=0, atol=0
-    )
+    torch.testing.assert_close(scale[~nan_mask], reference[~nan_mask], rtol=0, atol=0)
 
 
 @requires_cuda
@@ -485,9 +465,7 @@ def test_iq4_nl_ple_cuda_lookup_and_graph_replay(monkeypatch, pinned, rank):
         expected[(cpu_ids < rank * 4) | (cpu_ids >= (rank + 1) * 4)] = 0
         torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
         if pinned:
-            hidden_states = torch.empty(
-                2, 320, device="cuda", dtype=torch.bfloat16
-            )
+            hidden_states = torch.empty(2, 320, device="cuda", dtype=torch.bfloat16)
             layer.start_prefetch(hidden_states, ids)
             torch.testing.assert_close(
                 layer(hidden_states).cpu(), expected.flatten(-2), atol=0, rtol=0
@@ -516,9 +494,7 @@ def test_iq4_nl_ple_cuda_pinned_uva_lookup(monkeypatch):
     layer.embedding_method.process_weights_after_loading(layer)
     reference = _reference_rows(packed)
     ids = torch.tensor([4, 5, 6, 7, 3, 0], device="cuda")
-    output = torch.empty(
-        ids.shape[0], 160, device="cuda", dtype=layer.params_dtype
-    )
+    output = torch.empty(ids.shape[0], 160, device="cuda", dtype=layer.params_dtype)
     layer.embedding_method.lookup_from_pinned(layer, ids, output)
     expected = reference[ids.cpu()].to(torch.bfloat16)
     expected[(ids.cpu() < 4) | (ids.cpu() >= 8)] = 0
@@ -535,9 +511,7 @@ def test_iq4_nl_ple_cuda_special_float16_scales(monkeypatch):
     scale_bits = [0xBF00, 0x0000, 0x0001, 0x8001, 0x7BFF]
     packed = _make_packed_rows(scale_bits)
     _mock_etp_group(monkeypatch, world_size=1, rank=0)
-    monkeypatch.setattr(
-        parameter_module, "get_tensor_model_parallel_rank", lambda: 0
-    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
     )
