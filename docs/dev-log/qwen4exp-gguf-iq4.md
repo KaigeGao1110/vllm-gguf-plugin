@@ -472,6 +472,36 @@ for community support.
   `--max-num-seqs` to 32 to test whether the plugin's custom ops survive graph
   capture and how far throughput moves.
 
+### 2026-09-11 — P3 run 12: CUDA graphs
+
+- Same tree and sampler setting as run 11, without `--enforce-eager`, with
+  `--max-num-seqs 32` (`.dev/p3/p3-serve-graph.sh`). The plugin's custom ops
+  compiled and captured without changes: piecewise and full CUDA graphs in two
+  passes (7 s and 2 s, 0.28 GiB and 0.10 GiB). Engine init took 38.3 s; the API
+  was ready 2 min 33 s after launch.
+- KV cache 21.21 GiB, 625,868 tokens (19.1 concurrent 32,768-token requests).
+- Greedy outputs are identical to run 11: the same short answer, `7342` for the
+  13,847-token prompt, and the same 512-token text.
+- Speed (evidence `logs/p3-bench-run12.log` on the box):
+  - short prompt: first token 0.09 s; 13,847-token prompt: 16.92 s cold (the same
+    two Triton kernels JIT-compile on the first long request) and 1.62 s warm;
+  - decode: 132.7 tokens per second for a single 512-token answer, 4.4 times
+    eager mode;
+  - 256-token answers (`ignore_eos`) at concurrency 1, 4, 8, 16 and 32: 128.7,
+    303.6, 404.0, 505.1 and 562.0 tokens per second in aggregate; 128.8, 76.0,
+    50.6, 31.6 and 17.6 per request. The GPU drew 600 W at 100% utilisation.
+- Throughput flattens above 16 concurrent requests. Every routed expert is an IQ
+  type, and IQ types are not in `MMQ_QUANT_TYPES`, so every batch size runs the
+  per-row kernel: cost grows with tokens × top-k and nothing is batched per
+  expert. A grouped (MMQ) kernel for IQ3_S and IQ4_NL is the main lever for
+  serving capacity.
+- Remaining gaps before hosting: the FlashInfer sampler needs a CUDA toolkit with
+  cuRAND headers; the first long request pays for Triton JIT that warm-up does not
+  cover; quality has only been smoke-tested (no benchmark against the reference
+  checkpoint); context beyond 32,768 tokens, thinking mode, tool calls and a soak
+  test under load are untested; and the stack depends on a vLLM nightly plus the
+  unmerged #56273.
+
 ## Design decisions
 
 ### D1 — Implement IQ4_NL as a Level-3 PLE embedding method, not a worker
@@ -528,4 +558,4 @@ then copies each shard into the method's storage. No step may allocate the
 | P0 | Base pin, test environment, contracts, this log | done |
 | P1 | IQ4_NL PLE embedding method, Triton lookup kernel, `from_quant_config` hook | accepted after Core kernel repair, merged `2e9faa2`; 32 passed on GPU |
 | P2 | Port the `qwen4_exp` adapter to nightly and stream PLE shards | accepted, merged `4a99ed1`; real-checkpoint check passed |
-| P3 | Full download, full load, GPU kernel tests, generation, quality and performance | first generation on the PRO 6000 (run 11, eager) after fixes `db2d8b2`, `39efe53`, `32a1662`, `e1e120f`; graph mode in progress |
+| P3 | Full download, full load, GPU kernel tests, generation, quality and performance | first generation on the PRO 6000 (run 11, eager) after fixes `db2d8b2`, `39efe53`, `32a1662`, `e1e120f`; CUDA graphs (run 12): 133 tok/s single stream, 562 tok/s at 32 concurrent; quality benchmark, long context and soak pending |
