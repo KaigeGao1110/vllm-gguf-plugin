@@ -673,6 +673,78 @@ for community support.
     - The branches were opened as vllm-gguf-plugin #130 and #131, and validation
     comments were posted on plugin #125 and vLLM #55557.
 
+### 2026-09-11 — P3 runs 20–23: memory fraction 0.96, resource profile, prefix caching and 256K
+
+- Runs 20–23 start from the run 14 serve script (FP8 KV, `--max-num-batched-tokens
+  8192`, `--max-num-seqs 96`). Evidence `.dev/evidence/q4gguf-p3-*-run2[0-3]*.log`.
+
+  | run | change from run 14 | model load | KV memory | KV tokens | outcome |
+  | --- | --- | --- | --- | --- | --- |
+  | 20 | MTP with 1 draft token, `--gpu-memory-utilization 0.96` | 64.75 GiB | 22.32 GiB | 1,065,923 | failed at startup |
+  | 21 | MTP with 1 draft token, 0.94 | 64.75 GiB | 20.42 GiB | 975,329 | served; resource profile |
+  | 22 | no MTP, `--enable-prompt-tokens-details` | 61.84 GiB | 24.67 GiB | 1,454,899 | served; prefix-hit probe |
+  | 23 | run 22 plus `--max-model-len 262144`, tool and reasoning parsers, served as `qwen/qwen3.8-flash` | 61.84 GiB | 24.62 GiB | 1,874,470 | served; left resident |
+
+- Run 20 allocated a KV pool 9% larger than run 21, then died two seconds later.
+    - The failure was `torch.AcceleratorError: CUDA error: out of memory` inside a
+    breakable CUDA graph capture of the model, after the KV cache was allocated.
+    - PyTorch then raised a secondary `INTERNAL ASSERT FAILED ... markCaptureEnd
+    called with no captures in progress`, which hides the OOM in a short log tail.
+    - vLLM reported that 0.96 equals 0.9486 without CUDA graph memory profiling.
+    - 0.94 stays the memory fraction.
+- Run 21 resource profile, sampled every 2 s by `p3-stat.sh` on the 32-vCPU,
+  123 GiB host:
+
+  | phase | GPU util | GPU power | host CPU | EngineCore CPU | APIServer CPU |
+  | --- | --- | --- | --- | --- | --- |
+  | idle | 0% | 52 W (max 87) | 0.2% | 2% | 0% |
+  | 32 short requests, 455.6 tok/s | 88% | 525 W (max 600) | 3.4% (max 23.5%) | 11% (max 33%) | 3% |
+  | 63,415-token needle, first token 81.4 s, correct | 100% | 600 W (max 606) | 3.2% | 99% (max 102%) | 1% |
+
+    - GPU memory stayed at 95,236–95,242 MiB and the server logged no errors.
+    - Host RAM used was 40 GiB, EngineCore RSS 36.0 GiB and shared memory 32.1 GiB;
+    most of the rest was page cache over the GGUF files.
+    - Prefill is GPU-bound. During the needle, EngineCore's main thread used one core
+    while the GPU sat at 100% and the 600 W limit.
+- Run 22 measured prefix reuse without MTP.
+    - The GDN groups use the `align` Mamba cache mode, and the draft-group warning from
+    runs 18b and 21 is gone, so prefix reuse works again.
+    - Probe on a 33,820-token document (600 items):
+
+  | request | latency | cached tokens | correct |
+  | --- | --- | --- | --- |
+  | cold | 41.31 s | 0 | yes |
+  | different question | 3.11 s | 31,360 | yes |
+  | same question | 3.11 s | 31,360 | yes |
+  | second turn | 3.18 s | 31,360 | yes |
+
+    - Hits stop at a block boundary: 31,360 is 10 attention blocks of 3,136 tokens.
+    - The probe's second document (1,700 items) was rejected with HTTP 400. At the
+    first document's 56.4 tokens per item it is about 96K tokens, above the
+    65,536-token window, and the probe stopped there. Run 23 covers longer prefixes.
+- Run 23 serves 256K context. The server reports 7.15 concurrent requests at 262,144
+  tokens. KV memory matches run 22, yet the pool holds 29% more tokens; the cause was
+  not investigated.
+
+  | target | prompt tokens | cold latency | follow-up latency | cached on follow-up | correct |
+  | --- | --- | --- | --- | --- | --- |
+  | 128K | 131,196 | 165.3 s | 3.5 s | 128,576 | both |
+  | 250K | 258,153 | 334.6 s | 1.6 s | 257,152 | both |
+
+    - Cold prefill runs at about 790 tokens/s at 64K (run 14), 128K and 250K (788,
+    794 and 772), so prefill time grows linearly with length up to 250K.
+    - Peak GPU memory, sampled every second, was 94,218 MiB. The server logged no
+    errors.
+    - A cold 250K prefill holds the GPU for 5.6 minutes and other requests wait. A
+    short request from the local gateway timed out at 240 s during the probe and took
+    8.9 s afterwards.
+    - By 21:22Z the resident server had answered 868 chat requests, all with status
+    200, at a cumulative prefix-cache hit rate of 95.6%.
+- The run 23 server is left resident in tmux `q4serve`. It binds 127.0.0.1:8000
+  without an API key and is reached through an SSH tunnel. It is not supervised, so a
+  crash needs a manual restart. `p3-stat.sh` still samples to
+  `/root/q4/logs/p3-stat.log` (1.6 MB after 13 hours).
+
 ## Design decisions
 
 ### D1 — Implement IQ4_NL as a Level-3 PLE embedding method, not a worker
@@ -729,4 +801,4 @@ then copies each shard into the method's storage. No step may allocate the
 | P0 | Base pin, test environment, contracts, this log | done |
 | P1 | IQ4_NL PLE embedding method, Triton lookup kernel, `from_quant_config` hook | accepted after Core kernel repair, merged `2e9faa2`; 32 passed on GPU |
 | P2 | Port the `qwen4_exp` adapter to nightly and stream PLE shards | accepted, merged `4a99ed1`; real-checkpoint check passed |
-| P3 | Full download, full load, GPU kernel tests, generation, quality and performance | first generation on the PRO 6000 (run 11, eager) after fixes `db2d8b2`, `39efe53`, `32a1662`, `e1e120f`; CUDA graphs (run 12): 133 tok/s single stream, 562 tok/s at 32 concurrent; quality benchmark, long context and soak pending |
+| P3 | Full download, full load, GPU kernel tests, generation, quality and performance | first generation on the PRO 6000 (run 11, eager) after fixes `db2d8b2`, `39efe53`, `32a1662`, `e1e120f`; CUDA graphs (run 12): 133 tok/s single stream, 562 tok/s at 32 concurrent; long context (run 23): 250K needle correct, prefix follow-ups 1.6–3.5 s, left resident at 256K; quality benchmark and soak pending |
