@@ -20,6 +20,7 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLENvFp4EmbeddingMethod,
+    Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
 
@@ -99,8 +100,10 @@ def _mock_etp_group(monkeypatch, *, world_size=2, rank=0) -> None:
     )
 
 
-def _make_iq4_nl_ngram_embedding(monkeypatch, *, rank=0):
-    """Build a CPU device embedding holding 8 packed IQ4_NL rows in two ETP ranks."""
+def _make_iq4_nl_ngram_embedding(
+    monkeypatch, *, rank=0, device="cpu", pinned=False
+):
+    """Build a device or pinned embedding holding 8 packed IQ4_NL rows in two ETP ranks."""
     _mock_etp_group(monkeypatch, world_size=2, rank=rank)
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_rank", lambda: rank
@@ -108,8 +111,9 @@ def _make_iq4_nl_ngram_embedding(monkeypatch, *, rank=0):
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 2
     )
-    with torch.device("cpu"):
-        embedding = Qwen4ExpPLEDeviceEmbedding(
+    embedding_cls = Qwen4ExpPLEPinnedHostEmbedding if pinned else Qwen4ExpPLEDeviceEmbedding
+    with torch.device(device):
+        embedding = embedding_cls(
             8,
             160,
             params_dtype=torch.bfloat16,
@@ -133,6 +137,14 @@ def _make_iq4_nl_ngram_embedding(monkeypatch, *, rank=0):
     )
     module.ngram_embedding = embedding
     packed = torch.randint(0, 256, (8, 90), dtype=torch.uint8)
+    # Deterministic finite float16 scales (1.0 + k/1024) in every block, so
+    # FP32 products are exactly representable and no NaN/inf can appear.
+    for row in range(8):
+        for block in range(5):
+            bits = 0x3C00 + row * 5 + block
+            packed[row, block * 18 : block * 18 + 2] = torch.tensor(
+                [bits & 0xFF, (bits >> 8) & 0xFF], dtype=torch.uint8
+            )
     # Checkpoint shards cross ETP boundaries and arrive out of order.
     tensors = [
         (f"ngram_embedding.shard_{shard}.weight", packed[shard * 3 :][:3])
@@ -356,3 +368,163 @@ def test_lookup_dtype_and_dequantize(monkeypatch):
     converted = method.dequantize(layer, values, torch.float32)
     assert converted.dtype == torch.float32
     torch.testing.assert_close(converted, values.float(), rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# GPU: Triton kernel and pinned-host (UVA) lookup. These require CUDA and
+# skip on the CPU-only runner; the skips are expected and not counted as
+# passes.
+# ---------------------------------------------------------------------------
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA"
+)
+
+
+def test_iq4_nl_kernel_scale_formula_matches_float16_bits():
+    """The kernel's in-kernel float16 rebuild matches the bit-cast decode.
+
+    Runs on CPU: it validates the exact expression the Triton kernel uses
+    (sign, 5-bit exponent, 10-bit mantissa; subnormal / inf / NaN branches)
+    over every float16 bit pattern, so the GPU path can only differ by
+    execution, not by formula.
+    """
+    bits = torch.arange(65536, dtype=torch.int32)
+    sign = (bits >> 15) & 1
+    exponent = (bits >> 10) & 0x1F
+    mantissa = bits & 0x3FF
+    # Same construction as the Triton kernel: normal scales are the exact
+    # float32 bit pattern ((e + 112) << 23) | (m << 13).
+    normal_bits = ((exponent + 112) << 23) | (mantissa << 13)
+    scale = torch.where(
+        exponent == 0,
+        mantissa.to(torch.float32) * (2.0**-24),
+        torch.where(
+            exponent == 31,
+            torch.where(
+                mantissa == 0,
+                torch.tensor(float("inf")),
+                torch.tensor(float("nan")),
+            ),
+            normal_bits.view(torch.float32),
+        ),
+    )
+    scale = torch.where(sign == 1, -scale, scale)
+    reference = bits.to(torch.int16).view(torch.float16).float()
+
+    nan_mask = torch.isnan(reference)
+    assert torch.any(nan_mask)
+    assert torch.equal(torch.isnan(scale), nan_mask)
+    torch.testing.assert_close(
+        scale[~nan_mask], reference[~nan_mask], rtol=0, atol=0
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_iq4_nl_ple_cuda_lookup_and_graph_replay(monkeypatch, pinned, rank):
+    module, tensors, packed = _make_iq4_nl_ngram_embedding(
+        monkeypatch, rank=rank, device="cuda", pinned=pinned
+    )
+    module.load_weights(iter(tensors))
+    layer = module.ngram_embedding
+    layer.embedding_method.process_weights_after_loading(layer)
+    reference = _reference_rows(packed).to(layer.params_dtype).to("cuda")
+    ids = torch.tensor([[3, 4], [7, 0]], device="cuda")
+    lookup_fn = layer._lookup if pinned else torch.compile(layer, fullgraph=True)
+
+    def lookup():
+        return lookup_fn(ids)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            lookup()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = lookup()
+    for new_ids in ([[3, 4], [7, 0]], [[4, 3], [0, 7]]):
+        ids.copy_(torch.tensor(new_ids, device="cuda"))
+        graph.replay()
+        cpu_ids = ids.cpu()
+        expected = reference[cpu_ids]
+        expected[(cpu_ids < rank * 4) | (cpu_ids >= (rank + 1) * 4)] = 0
+        torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+        if pinned:
+            hidden_states = torch.empty(
+                2, 320, device="cuda", dtype=torch.bfloat16
+            )
+            layer.start_prefetch(hidden_states, ids)
+            torch.testing.assert_close(
+                layer(hidden_states).cpu(), expected.flatten(-2), atol=0, rtol=0
+            )
+    assert layer.weight.device.type == ("cpu" if pinned else "cuda")
+    # Empty ids return an empty tensor without launching the kernel.
+    assert lookup_fn(ids[:0]).shape == (0, 2, 160)
+    # Padded / out-of-range ids produce zero rows.
+    padded_ids = torch.tensor([[8, -1]], device="cuda")
+    torch.testing.assert_close(
+        lookup_fn(padded_ids),
+        torch.zeros(1, 2, 160, device="cuda", dtype=torch.bfloat16),
+        atol=0,
+        rtol=0,
+    )
+
+
+@requires_cuda
+def test_iq4_nl_ple_cuda_pinned_uva_lookup(monkeypatch):
+    """Direct lookup_from_pinned over the UVA view matches the gguf reference."""
+    module, tensors, packed = _make_iq4_nl_ngram_embedding(
+        monkeypatch, rank=1, device="cuda", pinned=True
+    )
+    module.load_weights(iter(tensors))
+    layer = module.ngram_embedding
+    layer.embedding_method.process_weights_after_loading(layer)
+    reference = _reference_rows(packed)
+    ids = torch.tensor([4, 5, 6, 7, 3, 0], device="cuda")
+    output = torch.empty(
+        ids.shape[0], 160, device="cuda", dtype=layer.params_dtype
+    )
+    layer.embedding_method.lookup_from_pinned(layer, ids, output)
+    expected = reference[ids.cpu()].to(torch.bfloat16)
+    expected[(ids.cpu() < 4) | (ids.cpu() >= 8)] = 0
+    torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+    # Empty ids are a no-op on the output tensor.
+    empty_output = torch.empty((0, 160), device="cuda", dtype=torch.bfloat16)
+    layer.embedding_method.lookup_from_pinned(layer, ids[:0], empty_output)
+    assert empty_output.shape == (0, 160)
+
+
+@requires_cuda
+def test_iq4_nl_ple_cuda_special_float16_scales(monkeypatch):
+    """Negative, zero, subnormal, and large float16 scales decode on device."""
+    scale_bits = [0xBF00, 0x0000, 0x0001, 0x8001, 0x7BFF]
+    packed = _make_packed_rows(scale_bits)
+    _mock_etp_group(monkeypatch, world_size=1, rank=0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    with torch.device("cuda"):
+        layer = Qwen4ExpPLEDeviceEmbedding(
+            packed.shape[0],
+            160,
+            params_dtype=torch.bfloat16,
+            padding_size=2,
+            prefix="test.ple_embedding.ngram_embedding",
+            embedding_method=Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod(),
+            num_ngram_heads=2,
+            max_total_tokens=4,
+        )
+    layer.weight.weight_loader(layer.weight, packed.to("cuda"))
+    layer.embedding_method.process_weights_after_loading(layer)
+    reference = _reference_rows(packed)
+    ids = torch.tensor([4, 2, 0, 4], device="cuda")
+    actual = layer(ids)
+    expected = reference[ids.cpu()].to(torch.bfloat16)
+    torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)

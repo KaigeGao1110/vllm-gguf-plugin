@@ -20,8 +20,9 @@ from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
 from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
 )
+from vllm.triton_utils import tl, triton
 
-from .ple_cpu import gather_iq4_nl_rows
+from .ple_cpu import _IQ4_NL_VALUES, gather_iq4_nl_rows
 
 GGUF_IQ4_NL_PLE_DTYPE = "gguf_iq4_nl"
 
@@ -45,6 +46,7 @@ class Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
 
     def __init__(self) -> None:
         self._loaded_ranges: set[tuple[int, int]] = set()
+        self._codebooks: dict[torch.device, torch.Tensor] = {}
 
     def create_weights(
         self,
@@ -122,6 +124,14 @@ class Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
     def lookup_dtype(self, layer: nn.Module) -> torch.dtype:
         return layer.params_dtype
 
+    def _codebook(self, device: torch.device) -> torch.Tensor:
+        """Return the float32 IQ4_NL codebook on ``device``."""
+        codebook = self._codebooks.get(device)
+        if codebook is None:
+            codebook = torch.tensor(_IQ4_NL_VALUES, dtype=torch.float32, device=device)
+            self._codebooks[device] = codebook
+        return codebook
+
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
         if not input_.is_cuda:
             return gather_iq4_nl_rows(
@@ -130,7 +140,45 @@ class Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
                 layer.embedding_dim,
                 dtype=layer.params_dtype,
             )
-        raise RuntimeError("CUDA IQ4_NL PLE lookup is not available")
+        ids = input_.reshape(-1)
+        output = torch.empty(
+            (*input_.shape, layer.embedding_dim),
+            dtype=layer.params_dtype,
+            device=input_.device,
+        )
+        if ids.numel():
+            _lookup_iq4_nl_ple_embedding_kernel[(ids.numel(),)](
+                layer.weight,
+                self._codebook(layer.weight.device),
+                ids,
+                output,
+                layer.embedding_dim,
+                layer.weight.shape[1],
+                0,
+                layer.weight.shape[0],
+                BLOCK_D=triton.next_power_of_2(layer.embedding_dim),
+            )
+        return output
+
+    def lookup_from_pinned(
+        self,
+        layer: nn.Module,
+        ids: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        if ids.numel() == 0:
+            return
+        _lookup_iq4_nl_ple_embedding_kernel[(ids.numel(),)](
+            layer._uva_weight,
+            self._codebook(layer._uva_weight.device),
+            ids,
+            output,
+            layer.embedding_dim,
+            layer._uva_weight.shape[1],
+            layer.shard_indices.org_vocab_start_index,
+            layer.shard_indices.org_vocab_end_index,
+            BLOCK_D=layer._block_d,
+        )
 
     def dequantize(
         self,
@@ -166,3 +214,60 @@ def patch_qwen4_exp_ple_embedding_method() -> None:
 
     setattr(from_quant_config, _PATCH_GUARD, True)
     base.from_quant_config = staticmethod(from_quant_config)
+
+
+@triton.jit
+def _lookup_iq4_nl_ple_embedding_kernel(
+    weight_ptr,
+    codebook_ptr,
+    ids_ptr,
+    output_ptr,
+    embedding_dim,
+    row_bytes,
+    vocab_start,
+    vocab_end,
+    BLOCK_D: tl.constexpr,
+):
+    """Decode one packed IQ4_NL row per program into the output table."""
+    row = tl.program_id(0)
+    idx = tl.load(ids_ptr + row).to(tl.int64)
+    owned = (idx >= vocab_start) & (idx < vocab_end)
+    local_idx = tl.where(owned, idx - vocab_start, 0)
+    offsets = tl.arange(0, BLOCK_D)
+    value_mask = offsets < embedding_dim
+    load_mask = owned & value_mask
+    block_index = offsets // 32
+    value_in_block = offsets % 32
+    byte_index = tl.where(value_in_block < 16, value_in_block, value_in_block - 16)
+    code = tl.load(
+        weight_ptr + local_idx * row_bytes + block_index * 18 + 2 + byte_index,
+        mask=load_mask,
+        other=0,
+    )
+    code = tl.where(value_in_block < 16, code & 0xF, (code >> 4) & 0xF)
+    block_base = weight_ptr + local_idx * row_bytes + block_index * 18
+    scale_low = tl.load(block_base, mask=load_mask, other=0)
+    scale_high = tl.load(block_base + 1, mask=load_mask, other=0)
+    # Little-endian float16 bits rebuilt from the two raw bytes.
+    scale_bits = scale_low + (scale_high << 8)
+    sign = (scale_bits >> 15) & 1
+    exponent = (scale_bits >> 10) & 0x1F
+    mantissa = scale_bits & 0x3FF
+    # Normal scales are (1 + m/1024) * 2**(e-15). The float16 significand is a
+    # subset of the float32 significand, so the exact value is the bit pattern
+    # ((e - 15 + 127) << 23) | (m << 13); reinterpreting the integer is exact,
+    # unlike an exp2-based computation whose approximation is only
+    # correctly rounded for large exponents.
+    normal_bits = ((exponent + 112) << 23) | (mantissa << 13)
+    scale = tl.where(
+        exponent == 0,
+        mantissa.to(tl.float32) * tl.exp2(-24.0),
+        tl.where(
+            exponent == 31,
+            tl.where(mantissa == 0, float("inf"), float("nan")),
+            tl.bitcast(normal_bits.to(tl.int32), tl.float32),
+        ),
+    )
+    scale = tl.where(sign == 1, -scale, scale)
+    values = tl.load(codebook_ptr + code, mask=load_mask, other=0.0) * scale
+    tl.store(output_ptr + row * embedding_dim + offsets, values, mask=value_mask)
