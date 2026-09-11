@@ -140,6 +140,42 @@ for community support.
   lookups included — pass here, so the base PLE paths the IQ4_NL method builds on
   work on this hardware before any plugin code is involved.
 
+### 2026-09-11 — P2 accepted and merged; checked against the real checkpoint
+
+- P2 delivered six signed commits (report: `.dev/reports/q4-p2-adapter-nightly-port.md`).
+  Independent acceptance on the delivered tree: CPU suite (adapter, zero-copy,
+  gguf utils, plugin, Gemma4, download, PLE CPU tests) **110 passed, 1 failed** — the
+  failure is the pre-existing `test_register_sets_engine_args_for_gguf_model`
+  recorded in P0. `ruff check .` and `ruff format --check .` (ruff 0.14.0, whole
+  repository) are clean. Merged as `4a99ed1`.
+- Facts P2 established from the nightly source, beyond the P0 notes:
+  - `ple_layer_ids` entries are 1-based: `ple_layer_ids=[2]` attaches the PLE module to
+    zero-based layer 1, so shard names are
+    `model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_{i}.weight`.
+  - The n-gram table has `padded_vocab_size` rows: the sum of one prime-sized block per
+    head (`nth_prime_after(ngram_vocab_size_base - 1, head + 1)`, Miller–Rabin), padded
+    to `make_ngram_vocab_size_divisible_by`. For Flash that is 320,001,446 rows padded
+    to 320,001,536, exactly the GGUF table's row count.
+  - `Qwen4ExpNGramEmbedding.load_weights` expects every one of `split_ngram_parts`
+    shards, including 0-row trailing shards, and checks each shard's shape exactly.
+  - The iterator synthesizes a `.weight_type` companion for every quantized tensor;
+    the adapter drops the PLE table's companion.
+  - Each `GGUFReader` maps the file at its own address, so aliasing tests must compare
+    against the same reader (or write through a second mapping), not a second reader's
+    pointer.
+- Real-checkpoint check on the GPU machine (no model construction; script
+  `.dev/p3/real_gguf_ple_shards.py`, evidence
+  `.dev/evidence/q4gguf-p3-real-ple-shards-4a99ed1-20260911T0250Z.log`), 12 s:
+  - config-derived padded rows 320,001,536; the PLE table is IQ4_NL in shard 2 with
+    array shape `[320001536, 90]`;
+  - the yielded tensor shares the reader's memory map; 128 shards with the expected
+    names, 2,500,012 rows each, contiguous views covering exactly the whole table;
+  - 64 rows (first, second, middle, last and 60 random) decoded by `ple_cpu` are
+    bit-identical to `gguf.quants.dequantize` (max abs diff 0.0), and the same rows
+    read through the shard views match the table bytes;
+  - resident memory 1,116 → 1,127 MiB across the expansion (max RSS 1,767 MiB), so
+    the 28.8 GB table is not copied on the way to the loader.
+
 ## Design decisions
 
 ### D1 — Implement IQ4_NL as a Level-3 PLE embedding method, not a worker
@@ -194,5 +230,5 @@ then copies each shard into the method's storage. No step may allocate the
 |---|---|---|
 | P0 | Base pin, test environment, contracts, this log | done |
 | P1 | IQ4_NL PLE embedding method, Triton lookup kernel, `from_quant_config` hook | in progress |
-| P2 | Port the `qwen4_exp` adapter to nightly and stream PLE shards | in progress |
+| P2 | Port the `qwen4_exp` adapter to nightly and stream PLE shards | accepted, merged `4a99ed1`; real-checkpoint check passed |
 | P3 | Full download, full load, GPU kernel tests, generation, quality and performance | environment and checkpoint ready; waiting for P1 and P2 |
