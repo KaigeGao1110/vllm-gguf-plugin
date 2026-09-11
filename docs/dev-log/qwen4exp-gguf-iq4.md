@@ -176,6 +176,39 @@ for community support.
   - resident memory 1,116 → 1,127 MiB across the expansion (max RSS 1,767 MiB), so
     the 28.8 GB table is not copied on the way to the loader.
 
+### 2026-09-11 — P1 accepted after a Core repair; kernel verified on the GPU
+
+- P1 delivered seven signed commits (report: `.dev/reports/q4-p1-iq4nl-ple-method.md`):
+  the `gguf_iq4_nl` method, a CPU decode path, a Triton lookup kernel, the
+  `from_quant_config` patch and its registration hook. The CPU runner passed
+  (84 passed, 39 skipped — all CUDA — and the pre-existing failure), and ruff was
+  clean. The six CUDA tests had never run.
+- On the PRO 6000 all six CUDA tests failed at Triton compilation. Two kernel
+  defects and one test defect, fixed by Core in `4a99f2c`:
+  1. Bytes loaded from the `uint8` table stay `uint8` in Triton, so
+     `scale_high << 8` overflowed and `bits & 0x3FF` failed to compile
+     (`Scalar 1023 is out of range for type uint8`). Every loaded byte is now
+     widened to `int32` before shifting or masking. A CPU-only formula test cannot
+     catch this, because it models the arithmetic with wide integers.
+  2. The kernel used `tl.bitcast`, which does not exist in Triton 3.7.1. Normal
+     float16 scales are now computed as `(1024 + m) * 2**e * 2**-25`: every factor
+     is exactly representable in float32 and every product has at most 11
+     significant bits, so the result is exact without libdevice `exp2`/`pow`
+     (which are not correctly rounded for all exponents). Subnormal scales use the
+     exact literal for `2**-24`. The CPU guard over all 65,536 float16 bit patterns
+     mirrors the new expression.
+  3. The CUDA graph-replay test compared CPU output with expected rows on CUDA.
+- After the repair, on the GPU: `tests/test_ple_iq4_nl_method.py` **32 passed** — CUDA
+  graph capture and replay on device and pinned-host storage for both ETP ranks,
+  direct `lookup_from_pinned` over the UVA view, out-of-shard ids returning zeros,
+  and negative, zero, subnormal and large scales, all bit-identical to
+  `gguf.quants.dequantize` after BF16 conversion. CPU runner unchanged (84 passed,
+  39 skipped, pre-existing failure); repo-wide ruff clean. Merged as `2e9faa2`.
+- Evidence: `.dev/evidence/q4gguf-p3-gpu-p1-{d67d066,fix1,fix2,fix3}-20260911.log`.
+- Lesson for the PR: Triton kernels in this plugin need their CUDA tests run on a
+  GPU before review; a green CPU run here said nothing about whether the kernel
+  compiled.
+
 ## Design decisions
 
 ### D1 — Implement IQ4_NL as a Level-3 PLE embedding method, not a worker
