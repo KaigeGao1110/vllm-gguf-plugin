@@ -7,6 +7,7 @@ import vllm.engine.arg_utils as arg_utils_module
 import vllm.transformers_utils.config as config_module
 from vllm.config.load import LoadConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.model_loader import (
     _LOAD_FORMAT_TO_MODEL_LOADER,
@@ -23,6 +24,8 @@ from .weights_adapter.diffusion.integration import _patch_diffusers_loader
 
 OOTGGUFConfig = GGUFConfig
 OOTGGUFModelLoader = GGUFModelLoader
+
+logger = init_logger(__name__)
 
 
 def _is_gguf_reference(model: str | None) -> bool:
@@ -118,6 +121,21 @@ def _patch_speculator_probe() -> None:
     config_module._gguf_speculator_probe_patched = True
 
 
+def _patch_qwen4_exp_ple_method() -> None:
+    try:
+        from vllm_gguf_plugin.quantization.ple_iq4_nl import (
+            patch_qwen4_exp_ple_embedding_method,
+        )
+    except ImportError:
+        logger.debug(
+            "Skipping IQ4_NL PLE embedding patch: vllm.models.qwen4_exp "
+            "is not available in this vLLM version"
+        )
+        return
+
+    patch_qwen4_exp_ple_embedding_method()
+
+
 def _register_omni_diffusion_quantization() -> None:
     try:
         from vllm_omni.quantization import register_quantization_override
@@ -146,3 +164,4 @@ def register() -> None:
     _patch_engine_args()
     _patch_speculator_probe()
     _patch_diffusers_loader()
+    _patch_qwen4_exp_ple_method()

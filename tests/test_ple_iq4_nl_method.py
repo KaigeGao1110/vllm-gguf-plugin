@@ -371,6 +371,37 @@ def test_lookup_dtype_and_dequantize(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Plugin hook: register() patches from_quant_config exactly once
+# ---------------------------------------------------------------------------
+
+
+def test_register_patches_ple_from_quant_config():
+    from vllm_gguf_plugin.plugin import register
+
+    register()
+    wrapper = _patched_from_quant_config()
+    assert getattr(wrapper, "_vllm_gguf_plugin_iq4_nl_patched", False)
+    assert isinstance(
+        wrapper(
+            None, "model.ngram_embedding", ple_iq4_nl.GGUF_IQ4_NL_PLE_DTYPE
+        ),
+        Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod,
+    )
+
+
+def test_register_twice_keeps_one_ple_wrapper():
+    from vllm_gguf_plugin.plugin import register
+
+    register()
+    register()
+    wrapper = _patched_from_quant_config()
+    assert getattr(wrapper, "_vllm_gguf_plugin_iq4_nl_patched", False)
+    unwrapped = getattr(wrapper, "__wrapped__", None)
+    assert unwrapped is _UNPATCHED_FROM_QUANT_CONFIG
+    assert not getattr(unwrapped, "_vllm_gguf_plugin_iq4_nl_patched", False)
+
+
+# ---------------------------------------------------------------------------
 # GPU: Triton kernel and pinned-host (UVA) lookup. These require CUDA and
 # skip on the CPU-only runner; the skips are expected and not counted as
 # passes.
