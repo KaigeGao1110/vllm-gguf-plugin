@@ -244,6 +244,12 @@ def ggml_moe_a8(
     )
 
 
+# CUDA caps a launch grid's z extent at 65,535. The per-row MoE kernels put one
+# (token, expert) row in each z slot, so a larger launch never runs and its
+# error stays pending until the next device allocation.
+_CUDA_MAX_GRID_Z = 65535
+
+
 def ggml_moe_a8_vec(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -254,8 +260,28 @@ def ggml_moe_a8_vec(
     tokens: int,
 ) -> torch.Tensor:
     if _cuda_kernel_available("ggml_moe_a8_vec", quant_type):
-        return torch.ops._C_gguf.ggml_moe_a8_vec(
-            X, W, topk_ids, top_k, quant_type, row, tokens
+        tokens_per_launch = _CUDA_MAX_GRID_Z // top_k
+        if tokens <= tokens_per_launch:
+            return torch.ops._C_gguf.ggml_moe_a8_vec(
+                X, W, topk_ids, top_k, quant_type, row, tokens
+            )
+        # The kernel reads expert ids as a flat array indexed by row, whatever
+        # shape the caller passes (the down projection passes top-k ids with
+        # top_k=1), so slice them flat alongside the token rows.
+        flat_ids = topk_ids.reshape(-1)
+        return torch.cat(
+            [
+                torch.ops._C_gguf.ggml_moe_a8_vec(
+                    X[start : start + tokens_per_launch],
+                    W,
+                    flat_ids[start * top_k : (start + tokens_per_launch) * top_k],
+                    top_k,
+                    quant_type,
+                    row,
+                    min(tokens_per_launch, tokens - start),
+                )
+                for start in range(0, tokens, tokens_per_launch)
+            ]
         )
     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
 
