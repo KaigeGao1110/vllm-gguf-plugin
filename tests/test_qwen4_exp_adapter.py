@@ -9,7 +9,10 @@ import gguf
 import numpy as np
 import pytest
 import torch
+from gguf import GGUFWriter, GGMLQuantizationType
+from transformers import PretrainedConfig
 
+from vllm_gguf_plugin.gguf_files import GGUFModelFiles
 from vllm_gguf_plugin.weights_adapter import (
     get_adapter_architecture,
     get_weights_adapter,
@@ -30,8 +33,16 @@ def test_qwen4_exp_registers_a_dedicated_native_architecture_adapter():
 
     assert type(adapter).__name__ == "Qwen4ExpGGUFAdapter"
     assert (
-        get_adapter_architecture(config) == "Qwen3_8FlashNextForConditionalGeneration"
+        get_adapter_architecture(config) == "Qwen4ExpForConditionalGeneration"
     )
+    # The pinned nightly image must actually register the official architecture
+    # and its module path must import (the registry's target is
+    # vllm.models.qwen4_exp, which re-exports the platform model class).
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+
+    assert "Qwen4ExpForConditionalGeneration" in ModelRegistry.get_supported_archs()
+    assert Qwen4ExpForConditionalGeneration.__name__ == "Qwen4ExpForConditionalGeneration"
 
 
 def test_qwen4_exp_does_not_match_other_qwen_architectures():
@@ -227,12 +238,91 @@ def test_qwen4_exp_decodes_actual_q8_hc_projection_for_native_float_loader():
     )
 
 
-def test_qwen4_exp_refuses_unwired_ple_before_file_access_or_model_construction():
+def _make_small_gguf(tmp_path: Path, ple_type: GGMLQuantizationType | None) -> str:
+    """Write a tiny GGUF whose only tensor is the packed PLE table.
+
+    Each row is one packed IQ4_NL-equivalent width expressed in the byte size
+    of the requested quant type (IQ4_NL 90, Q8_0 34, IQ4_XS 136 bytes/row), so
+    the header type is what the tests assert on.
+    """
+    path = tmp_path / "model.gguf"
+    writer = GGUFWriter(str(path), "qwen4_exp")
+    if ple_type is not None:
+        from gguf.constants import GGML_QUANT_SIZES
+
+        bytes_per_row = GGML_QUANT_SIZES[ple_type][1]
+        ple = np.arange(3 * bytes_per_row, dtype=np.uint8).reshape(3, bytes_per_row)
+        writer.add_tensor("per_layer_token_embd.weight", ple, raw_dtype=ple_type)
+    else:
+        other = np.zeros((4,), dtype=np.float32)
+        writer.add_tensor("token_embd.weight", other)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    return str(path)
+
+
+def _qwen4_hf_config(ple_layer_ids: list[int] | None = [2]) -> PretrainedConfig:
+    config = PretrainedConfig(model_type="qwen4_exp")
+    config.ple_layer_ids = ple_layer_ids or []
+    return config
+
+
+def test_qwen4_exp_iq4_nl_ple_marks_the_text_config(tmp_path):
     from vllm_gguf_plugin.weights_adapter.qwen4_exp import Qwen4ExpGGUFAdapter
 
-    config = SimpleNamespace(get_text_config=lambda: SimpleNamespace(ple_layer_ids=[2]))
-    with pytest.raises(NotImplementedError, match="CPU PLE worker"):
-        Qwen4ExpGGUFAdapter().patch_hf_config(SimpleNamespace(), config)
+    path = _make_small_gguf(tmp_path, GGMLQuantizationType.IQ4_NL)
+    config = _qwen4_hf_config([2])
+
+    patched = Qwen4ExpGGUFAdapter().patch_hf_config(
+        GGUFModelFiles(backbone=(path,)), config
+    )
+
+    assert patched.architectures == ["Qwen4ExpForConditionalGeneration"]
+    assert patched.get_text_config().ple_embedding_dtype == "gguf_iq4_nl"
+
+
+def test_qwen4_exp_without_ple_layers_needs_no_marker(tmp_path):
+    from vllm_gguf_plugin.weights_adapter.qwen4_exp import Qwen4ExpGGUFAdapter
+
+    path = _make_small_gguf(tmp_path, None)
+    config = _qwen4_hf_config([])
+
+    patched = Qwen4ExpGGUFAdapter().patch_hf_config(
+        GGUFModelFiles(backbone=(path,)), config
+    )
+
+    assert patched.architectures == ["Qwen4ExpForConditionalGeneration"]
+    assert not hasattr(patched.get_text_config(), "ple_embedding_dtype")
+
+
+@pytest.mark.parametrize(
+    "ple_type", [GGMLQuantizationType.Q8_0, GGMLQuantizationType.IQ4_XS]
+)
+def test_qwen4_exp_rejects_non_iq4_nl_ple_type_naming_the_type(tmp_path, ple_type):
+    from vllm_gguf_plugin.weights_adapter.qwen4_exp import Qwen4ExpGGUFAdapter
+
+    path = _make_small_gguf(tmp_path, ple_type)
+    config = _qwen4_hf_config([2])
+
+    with pytest.raises(NotImplementedError) as excinfo:
+        Qwen4ExpGGUFAdapter().patch_hf_config(
+            GGUFModelFiles(backbone=(path,)), config
+        )
+    assert ple_type.name in str(excinfo.value)
+
+
+def test_qwen4_exp_rejects_missing_ple_tensor_when_ple_enabled(tmp_path):
+    from vllm_gguf_plugin.weights_adapter.qwen4_exp import Qwen4ExpGGUFAdapter
+
+    path = _make_small_gguf(tmp_path, None)
+    config = _qwen4_hf_config([2])
+
+    with pytest.raises(NotImplementedError, match="per_layer_token_embd"):
+        Qwen4ExpGGUFAdapter().patch_hf_config(
+            GGUFModelFiles(backbone=(path,)), config
+        )
 
 
 def test_qwen4_exp_rejects_vision_outside_this_text_only_experiment():

@@ -24,9 +24,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 QWEN4_EXP_MODEL_TYPES = ("qwen4_exp",)
-# The retained vLLM image exposes the Qwen4Exp config under the
-# qwen3_8_flash_next model package and uses this concrete architecture name.
-QWEN4_EXP_ARCHITECTURE = "Qwen3_8FlashNextForConditionalGeneration"
+# Official architecture name registered in the pinned nightly image's
+# ModelRegistry (vllm/models/qwen4_exp); the old qwen3_8_flash_next
+# stand-in name is no longer used.
+QWEN4_EXP_ARCHITECTURE = "Qwen4ExpForConditionalGeneration"
 
 _LAYER_SUBSTR = {
     # Gated delta-net / linear-attention names emitted by the pinned converter.
@@ -111,6 +112,21 @@ def _map_layer_name(name: str, backbone_prefix: str) -> str | None:
     return None
 
 
+def _find_gguf_tensor_type(
+    files: GGUFModelFiles, name: str
+) -> gguf.GGMLQuantizationType | None:
+    """Return the GGML type of *name* from the GGUF header, or ``None``.
+
+    Reading ``reader.tensors`` touches only the header and tensor index; no
+    payload bytes are read.
+    """
+    for path in files.backbone:
+        for tensor in gguf.GGUFReader(path).tensors:
+            if tensor.name == name:
+                return tensor.tensor_type
+    return None
+
+
 def _map_name(name: str, backbone_prefix: str, *, multimodal: bool) -> str | None:
     for source, target in _TOP_PREFIX.items():
         if name.startswith(source):
@@ -118,9 +134,9 @@ def _map_name(name: str, backbone_prefix: str, *, multimodal: bool) -> str | Non
                 return target + name[len(source) :]
             return backbone_prefix + target + name[len(source) :]
     if name == _PLE_PACKED_SUFFIX:
-        # This is intentionally a visible intermediate target.  The native
-        # Qwen4Exp loader has no GGUF IQ4_NL row-table hook in this plugin yet;
-        # transform_weights raises before an unsafe eager load can occur.
+        # Intentionally a visible intermediate target: the iterator hands the
+        # packed table to transform_weights, which expands it into the native
+        # ngram_embedding.shard_{i}.weight shards.
         return backbone_prefix + "per_layer_token_embd.weight"
     return _map_layer_name(name, backbone_prefix)
 
@@ -148,19 +164,32 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
         files: GGUFModelFiles,
         hf_config: PretrainedConfig,
     ) -> PretrainedConfig:
-        if getattr(hf_config.get_text_config(), "ple_layer_ids", []):
-            raise NotImplementedError(
-                "The GGUF CPU PLE worker is not wired into the native loader; "
-                "refusing model construction before any full PLE allocation. "
-                "Only configuration, mapping, and selected-row CPU probes are "
-                "qualified by this experimental adapter."
-            )
+        text_config = hf_config.get_text_config()
+        if getattr(text_config, "ple_layer_ids", []):
+            ple_type = _find_gguf_tensor_type(files, _PLE_PACKED_SUFFIX)
+            if ple_type is None:
+                raise NotImplementedError(
+                    "The config enables per-layer embeddings (ple_layer_ids) "
+                    f"but the GGUF contains no {_PLE_PACKED_SUFFIX} tensor; "
+                    "refusing to load without the packed PLE table."
+                )
+            if ple_type != gguf.GGMLQuantizationType.IQ4_NL:
+                raise NotImplementedError(
+                    f"Only the IQ4_NL packed PLE table has been qualified, "
+                    f"but {_PLE_PACKED_SUFFIX} is {ple_type.name}; refusing "
+                    "to expand the table."
+                )
         patched = maybe_patch_hf_config_from_gguf(
             files.primary_backbone,
             hf_config,
             mmproj_path=files.mm_proj,
         )
         patched.architectures = [QWEN4_EXP_ARCHITECTURE]
+        if getattr(text_config, "ple_layer_ids", []):
+            # Qwen4ExpNGramEmbedding selects its PLE embedding method from
+            # this marker; the adapter streams the IQ4_NL rows still packed,
+            # so no step allocates the expanded table.
+            text_config.ple_embedding_dtype = "gguf_iq4_nl"
         return patched
 
     def build_name_map(
