@@ -241,14 +241,10 @@ def _ngram_ple_shard_names(text_config) -> tuple[str, ...]:
     parts = int(text_config.split_ngram_parts)
     if parts <= 0:
         raise ValueError(f"split_ngram_parts must be positive, got {parts}")
-    return tuple(
-        f"{prefix}ngram_embedding.shard_{i}.weight" for i in range(parts)
-    )
+    return tuple(f"{prefix}ngram_embedding.shard_{i}.weight" for i in range(parts))
 
 
-def _ngram_ple_shard_weights(
-    weight: torch.Tensor, text_config
-) -> Iterable[GGUFWeight]:
+def _ngram_ple_shard_weights(weight: torch.Tensor, text_config) -> Iterable[GGUFWeight]:
     """Expand the packed IQ4_NL PLE table into native shard weights.
 
     The table arrives as a zero-copy uint8 view of the GGUF payload: one
@@ -262,8 +258,7 @@ def _ngram_ple_shard_weights(
     """
     if weight.dtype != torch.uint8:
         raise ValueError(
-            "The packed PLE table must arrive as raw uint8 bytes, got "
-            f"{weight.dtype}"
+            f"The packed PLE table must arrive as raw uint8 bytes, got {weight.dtype}"
         )
     rows_total = _padded_ngram_vocab_size(text_config)
     ngram_heads = (int(text_config.ngram_size) - 1) * int(text_config.heads_per_ngram)

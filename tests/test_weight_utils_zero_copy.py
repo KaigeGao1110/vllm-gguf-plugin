@@ -12,9 +12,8 @@ the packed PLE table is exactly what this path must avoid).
 import warnings
 
 import numpy as np
-import pytest
 import torch
-from gguf import GGUFWriter, GGMLQuantizationType
+from gguf import GGMLQuantizationType, GGUFWriter
 
 from vllm_gguf_plugin.weight_utils import (
     gguf_quant_weights_iterator_multi,

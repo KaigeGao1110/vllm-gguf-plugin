@@ -9,7 +9,7 @@ import gguf
 import numpy as np
 import pytest
 import torch
-from gguf import GGUFWriter, GGMLQuantizationType
+from gguf import GGMLQuantizationType, GGUFWriter
 from transformers import PretrainedConfig
 
 from vllm_gguf_plugin.gguf_files import GGUFModelFiles
@@ -32,9 +32,7 @@ def test_qwen4_exp_registers_a_dedicated_native_architecture_adapter():
     adapter = get_weights_adapter(config)
 
     assert type(adapter).__name__ == "Qwen4ExpGGUFAdapter"
-    assert (
-        get_adapter_architecture(config) == "Qwen4ExpForConditionalGeneration"
-    )
+    assert get_adapter_architecture(config) == "Qwen4ExpForConditionalGeneration"
     # The pinned nightly image must actually register the official architecture
     # and its module path must import (the registry's target is
     # vllm.models.qwen4_exp, which re-exports the platform model class).
@@ -42,7 +40,9 @@ def test_qwen4_exp_registers_a_dedicated_native_architecture_adapter():
     from vllm.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 
     assert "Qwen4ExpForConditionalGeneration" in ModelRegistry.get_supported_archs()
-    assert Qwen4ExpForConditionalGeneration.__name__ == "Qwen4ExpForConditionalGeneration"
+    assert Qwen4ExpForConditionalGeneration.__name__ == (
+        "Qwen4ExpForConditionalGeneration"
+    )
 
 
 def test_qwen4_exp_does_not_match_other_qwen_architectures():
@@ -121,8 +121,9 @@ def test_qwen4_exp_rejects_unknown_converter_tensor_names(monkeypatch):
 
 def _load_tensor_directory_fixture() -> dict:
     return json.loads(
-        (Path(__file__).parent
-         / "fixtures/qwen4_exp_iq4_xs_tensor_directory.json").read_text()
+        (
+            Path(__file__).parent / "fixtures/qwen4_exp_iq4_xs_tensor_directory.json"
+        ).read_text()
     )
 
 
@@ -148,7 +149,9 @@ def test_qwen4_exp_replays_all_fixture_names_to_unique_targets(monkeypatch):
     ple_target = mapped["per_layer_token_embd.weight"]
     assert ple_target == "model.language_model.per_layer_token_embd.weight"
     non_ple_targets = [
-        target for name, target in mapped.items() if name != "per_layer_token_embd.weight"
+        target
+        for name, target in mapped.items()
+        if name != "per_layer_token_embd.weight"
     ]
     assert len(non_ple_targets) == 1223
     assert len(set(non_ple_targets)) == 1223, "duplicate mapping targets"
@@ -166,11 +169,12 @@ def test_qwen4_exp_ple_expands_to_nightly_shard_names_resolving_under_the_model(
     """
     import inspect
 
-    from vllm_gguf_plugin.weights_adapter import qwen4_exp
     from vllm.models.qwen4_exp import Qwen4ExpForConditionalGeneration
     from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpDecoderLayer
     from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding
     from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
+
+    from vllm_gguf_plugin.weights_adapter import qwen4_exp
 
     text_config = SimpleNamespace(
         ple_layer_ids=[2],
@@ -219,8 +223,9 @@ def test_qwen4_exp_ple_expands_to_nightly_shard_names_resolving_under_the_model(
 
 def test_qwen4_exp_padded_ngram_vocab_matches_nightly_layout():
     """The plugin's prime layout must equal the nightly's, padded or not."""
-    from vllm_gguf_plugin.weights_adapter import qwen4_exp
     from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding
+
+    from vllm_gguf_plugin.weights_adapter import qwen4_exp
 
     base = 20_000_000
     ngram_heads = (3 - 1) * 8
@@ -242,7 +247,9 @@ def test_qwen4_exp_padded_ngram_vocab_matches_nightly_layout():
     padded = qwen4_exp._padded_ngram_vocab_size(text_config)
     assert padded == ((total + 127) // 128) * 128
     fixture = _load_tensor_directory_fixture()
-    ple = next(t for t in fixture["tensors"] if t["name"] == "per_layer_token_embd.weight")
+    ple = next(
+        t for t in fixture["tensors"] if t["name"] == "per_layer_token_embd.weight"
+    )
     assert ple["shape"] == [160, padded]
 
 
@@ -288,29 +295,31 @@ def _ple_transform_config(**overrides):
     base.update(overrides)
     return SimpleNamespace(
         dtype=torch.bfloat16,
-        hf_config=SimpleNamespace(
-            get_text_config=lambda: SimpleNamespace(**base)
-        ),
+        hf_config=SimpleNamespace(get_text_config=lambda: SimpleNamespace(**base)),
     )
 
 
 def test_qwen4_exp_synthentic_ple_vocab_matches_nightly_layout():
     """The synthetic config's padded vocab must equal the nightly's layout."""
-    from vllm_gguf_plugin.weights_adapter import qwen4_exp
     from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding
+
+    from vllm_gguf_plugin.weights_adapter import qwen4_exp
 
     _, _, total = Qwen4ExpNGramEmbedding._make_vocab_layout(
         ngram_vocab_size_base=300, ngram_heads=2, ple_dense_layer_id=0
     )
     assert total == _PLE_TEST_ROWS
-    assert qwen4_exp._padded_ngram_vocab_size(
-        SimpleNamespace(
-            ngram_size=2,
-            heads_per_ngram=2,
-            ngram_vocab_size_base=300,
-            make_ngram_vocab_size_divisible_by=1,
+    assert (
+        qwen4_exp._padded_ngram_vocab_size(
+            SimpleNamespace(
+                ngram_size=2,
+                heads_per_ngram=2,
+                ngram_vocab_size_base=300,
+                make_ngram_vocab_size_divisible_by=1,
+            )
         )
-    ) == _PLE_TEST_ROWS
+        == _PLE_TEST_ROWS
+    )
 
 
 def _ple_weights(row_count: int, include_companion: bool = True):
@@ -331,7 +340,9 @@ def test_qwen4_exp_streams_ple_shards_zero_copy_and_byte_exact():
     rows = _PLE_TEST_ROWS
     weights = _ple_weights(rows)
 
-    out = list(Qwen4ExpGGUFAdapter().transform_weights(weights, _ple_transform_config()))
+    out = list(
+        Qwen4ExpGGUFAdapter().transform_weights(weights, _ple_transform_config())
+    )
 
     assert [name for name, _ in out] == [
         f"model.language_model.layers.1.ple.ple_embedding."
@@ -426,9 +437,7 @@ def test_qwen4_exp_rejects_ple_row_count_mismatch():
 def test_qwen4_exp_rejects_ple_payload_with_bad_byte_length():
     from vllm_gguf_plugin.weights_adapter.qwen4_exp import Qwen4ExpGGUFAdapter
 
-    weight = torch.randint(
-        0, 256, (_PLE_TEST_ROWS * 90 + 7,), dtype=torch.uint8
-    )
+    weight = torch.randint(0, 256, (_PLE_TEST_ROWS * 90 + 7,), dtype=torch.uint8)
     weights = [("model.language_model.per_layer_token_embd.weight", weight)]
 
     with pytest.raises(ValueError, match=str(_PLE_TEST_ROWS * 90)):
@@ -535,7 +544,9 @@ def _make_small_gguf(tmp_path: Path, ple_type: GGMLQuantizationType | None) -> s
     return str(path)
 
 
-def _qwen4_hf_config(ple_layer_ids: list[int] | None = [2]) -> PretrainedConfig:
+def _qwen4_hf_config(ple_layer_ids: list[int] | None = None) -> PretrainedConfig:
+    if ple_layer_ids is None:
+        ple_layer_ids = [2]
     config = PretrainedConfig(model_type="qwen4_exp")
     config.ple_layer_ids = ple_layer_ids or []
     return config
@@ -579,9 +590,7 @@ def test_qwen4_exp_rejects_non_iq4_nl_ple_type_naming_the_type(tmp_path, ple_typ
     config = _qwen4_hf_config([2])
 
     with pytest.raises(NotImplementedError) as excinfo:
-        Qwen4ExpGGUFAdapter().patch_hf_config(
-            GGUFModelFiles(backbone=(path,)), config
-        )
+        Qwen4ExpGGUFAdapter().patch_hf_config(GGUFModelFiles(backbone=(path,)), config)
     assert ple_type.name in str(excinfo.value)
 
 
@@ -592,9 +601,7 @@ def test_qwen4_exp_rejects_missing_ple_tensor_when_ple_enabled(tmp_path):
     config = _qwen4_hf_config([2])
 
     with pytest.raises(NotImplementedError, match="per_layer_token_embd"):
-        Qwen4ExpGGUFAdapter().patch_hf_config(
-            GGUFModelFiles(backbone=(path,)), config
-        )
+        Qwen4ExpGGUFAdapter().patch_hf_config(GGUFModelFiles(backbone=(path,)), config)
 
 
 def test_qwen4_exp_rejects_vision_outside_this_text_only_experiment():
