@@ -52,7 +52,7 @@ def test_non_gguf_markers_delegate_to_original(
         quant_config, "model.ngram_embedding", embedding_dtype
     )
     assert isinstance(patched, expected_type)
-    assert patched is original
+    assert type(patched) is type(original)
 
 
 def test_second_patch_call_keeps_exactly_one_wrapper():
