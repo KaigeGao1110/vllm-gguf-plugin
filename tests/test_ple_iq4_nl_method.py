@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Selection tests for the packed IQ4_NL Qwen4Exp PLE embedding method."""
+"""Tests for the packed IQ4_NL Qwen4Exp PLE embedding method."""
+
+from types import SimpleNamespace
 
 import pytest
+import torch
+from torch import nn
 
+import vllm.model_executor.parameter as parameter_module
 import vllm.models.qwen4_exp.nvidia.ngram_embedding as ngram_embedding_module
 from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLEDeviceEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLENvFp4EmbeddingMethod,
@@ -12,6 +19,9 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
 )
 
 import vllm_gguf_plugin.quantization.ple_iq4_nl as ple_iq4_nl
+from vllm_gguf_plugin.quantization.ple_iq4_nl import (
+    Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod,
+)
 
 _UNPATCHED_FROM_QUANT_CONFIG = (
     ngram_embedding_module.Qwen4ExpPLEEmbeddingMethod.from_quant_config
@@ -63,3 +73,118 @@ def test_second_patch_call_keeps_exactly_one_wrapper():
     unwrapped = getattr(wrapper, "__wrapped__", None)
     assert unwrapped is _UNPATCHED_FROM_QUANT_CONFIG
     assert not getattr(unwrapped, "_vllm_gguf_plugin_iq4_nl_patched", False)
+
+
+# ---------------------------------------------------------------------------
+# Loading: packed uint8 shards through Qwen4ExpNGramEmbedding.load_weights
+# ---------------------------------------------------------------------------
+
+
+def _mock_etp_group(monkeypatch, *, world_size=2, rank=0) -> None:
+    group = SimpleNamespace(
+        rank_in_group=rank,
+        world_size=world_size,
+        all_reduce=lambda tensor: tensor,
+    )
+    monkeypatch.setattr(ngram_embedding_module, "get_etp_group", lambda: group)
+    monkeypatch.setattr(
+        ngram_embedding_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=world_size),
+    )
+
+
+def _make_iq4_nl_ngram_embedding(monkeypatch, *, rank=0):
+    """Build a CPU device embedding holding 8 packed IQ4_NL rows in two ETP ranks."""
+    _mock_etp_group(monkeypatch, world_size=2, rank=rank)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_rank", lambda: rank
+    )
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    with torch.device("cpu"):
+        embedding = Qwen4ExpPLEDeviceEmbedding(
+            8,
+            160,
+            params_dtype=torch.bfloat16,
+            padding_size=2,
+            prefix="test.ple_embedding.ngram_embedding",
+            embedding_method=Qwen4ExpPLEGGUFIQ4NLEmbeddingMethod(),
+            num_ngram_heads=2,
+            max_total_tokens=4,
+        )
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module.split_ngram_parts = 3
+    module.register_buffer(
+        "layer_multipliers", torch.zeros(1, dtype=torch.long)
+    )
+    module.register_buffer(
+        "ngram_heads_offsets", torch.zeros(1, dtype=torch.long)
+    )
+    module.register_buffer(
+        "ngram_heads_vocab_sizes", torch.zeros(1, dtype=torch.long)
+    )
+    module.ngram_embedding = embedding
+    packed = torch.randint(0, 256, (8, 90), dtype=torch.uint8)
+    # Checkpoint shards cross ETP boundaries and arrive out of order.
+    tensors = [
+        (f"ngram_embedding.shard_{shard}.weight", packed[shard * 3 :][:3])
+        for shard in (2, 0, 1)
+    ]
+    return module, tensors, packed
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_iq4_nl_ple_loads_streamed_shards_across_etp_boundaries(
+    monkeypatch, rank
+):
+    module, tensors, packed = _make_iq4_nl_ngram_embedding(monkeypatch, rank=rank)
+    loaded = set()
+    for start in range(0, len(tensors), 2):
+        loaded.update(module.load_weights(iter(tensors[start : start + 2])))
+    layer = module.ngram_embedding
+    layer.embedding_method.process_weights_after_loading(layer)
+
+    assert loaded == {"ngram_embedding.weight"}
+    assert layer.weight.dtype == torch.uint8
+    assert layer.weight.shape == (4, 90)
+    torch.testing.assert_close(layer.weight, packed[rank * 4 :][:4])
+
+
+@pytest.mark.parametrize(
+    "missing", ["shard_0.weight", "shard_1.weight", "all"]
+)
+def test_iq4_nl_ple_rejects_missing_local_shards(monkeypatch, missing):
+    module, tensors, _ = _make_iq4_nl_ngram_embedding(monkeypatch)
+    module.load_weights(
+        (
+            name,
+            tensor,
+        )
+        for name, tensor in tensors
+        if missing != name.removeprefix("ngram_embedding.")
+        and not (missing == "all" and ".shard_" in name)
+    )
+    layer = module.ngram_embedding
+    with pytest.raises(ValueError, match="missing rows starting at local row"):
+        layer.embedding_method.process_weights_after_loading(layer)
+
+
+def test_iq4_nl_ple_rejects_float_shard(monkeypatch):
+    module, tensors, _ = _make_iq4_nl_ngram_embedding(monkeypatch)
+    name, tensor = next(
+        pair for pair in tensors if pair[0] == "ngram_embedding.shard_0.weight"
+    )
+    with pytest.raises(ValueError, match="uint8"):
+        module.load_weights([(name, tensor.float())])
+
+
+def test_iq4_nl_ple_rejects_wrong_row_width(monkeypatch):
+    module, tensors, _ = _make_iq4_nl_ngram_embedding(monkeypatch)
+    name, tensor = next(
+        pair for pair in tensors if pair[0] == "ngram_embedding.shard_0.weight"
+    )
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        module.load_weights([(name, tensor[:, :-1])])
