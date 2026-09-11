@@ -115,6 +115,31 @@ for community support.
   `engram_config.cpu_offload` (or `VLLM_PLE_CPU_OFFLOAD=1`) is set, otherwise on the
   device.
 
+### 2026-09-11 — P1/P2 dispatched; GPU environment prepared for P3
+
+- P1 and P2 run in parallel in separate worktrees from `759e3df`, each with its own
+  append-as-you-go report under `.dev/reports/`. Both are implemented by a coding
+  agent driven by Qwen3.8-27B; every step is committed with its RED/GREEN test
+  evidence, and acceptance is done independently before integration.
+- GPU machine: one RTX PRO 6000 Blackwell Workstation Edition in a rented container
+  (power limit 600 W, max memory clock 14001 MHz, ECC disabled, 97,887 MiB, driver
+  595.71.05 / CUDA 13.2, 123 GB RAM, 61 GB `/dev/shm`). There is no Docker inside the
+  container, so vLLM is installed into a virtual environment instead of the image:
+  - `vllm-0.28.1rc1.dev628+g2a02f6efe` from the per-commit wheel index
+    (`https://wheels.vllm.ai/2a02f6ef…/`), the same build as the CPU test image;
+    PyTorch 2.13.0+cu130, Triton 3.7.1, Transformers 5.17.0, `gguf==0.19.0`.
+  - #56273's `ngram_embedding.py` overlaid into the installed package; SHA-256 checked
+    after copying, same value as in D3.
+- Checkpoint downloaded at the pinned revision: the three `UD-IQ4_XS` shards
+  (10,946,624 + 49,835,229,856 + 43,836,407,744 bytes). Each shard's SHA-256 matches
+  the Hugging Face LFS object id (`5ce89370…`, `577a38a2…`, `d4634e6d…`). Config and
+  tokenizer files come from `Qwen/Qwen3.8-Flash-Next` at `de4b8e4d`, without the
+  safetensors weights.
+- Upstream `tests/models/qwen4_exp/test_ple.py` from #56273 on this GPU: **67 passed,
+  0 skipped** (19 s). The 33 cases that skip on CPU — device and pinned-host NVFP4
+  lookups included — pass here, so the base PLE paths the IQ4_NL method builds on
+  work on this hardware before any plugin code is involved.
+
 ## Design decisions
 
 ### D1 — Implement IQ4_NL as a Level-3 PLE embedding method, not a worker
@@ -167,7 +192,7 @@ then copies each shard into the method's storage. No step may allocate the
 
 | ID | Scope | State |
 |---|---|---|
-| P0 | Base pin, test environment, contracts, this log | in progress |
-| P1 | IQ4_NL PLE embedding method, Triton lookup kernel, `from_quant_config` hook | pending |
-| P2 | Port the `qwen4_exp` adapter to nightly and stream PLE shards | pending |
-| P3 | Full download, full load, GPU kernel tests, generation, quality and performance | blocked on a GPU |
+| P0 | Base pin, test environment, contracts, this log | done |
+| P1 | IQ4_NL PLE embedding method, Triton lookup kernel, `from_quant_config` hook | in progress |
+| P2 | Port the `qwen4_exp` adapter to nightly and stream PLE shards | in progress |
+| P3 | Full download, full load, GPU kernel tests, generation, quality and performance | environment and checkpoint ready; waiting for P1 and P2 |
