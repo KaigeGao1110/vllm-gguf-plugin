@@ -745,6 +745,44 @@ for community support.
   crash needs a manual restart. `p3-stat.sh` still samples to
   `/root/q4/logs/p3-stat.log` (1.6 MB after 13 hours).
 
+- **Run 24 — why short requests wait ten seconds (2026-09-11 22:2xZ–22:4xZ,
+  no restart, resident run 23 server).** Callers reported that reading long context
+  through the local gateway had become slow. The complaint reproduces on a request
+  that generates four tokens: over 90 seconds, 14 such requests measured min 0.38 s,
+  p50 4.19 s, p90 10.05 s, max 19.30 s.
+    - The cause is the scheduler step, not the GPU. `--max-num-batched-tokens 8192`
+    divided by the measured prefill rate of 790 tok/s is 10.4 s of compute in a single
+    step, and no request emits a token until the step ends. The measured p90 of
+    10.05 s matches that prediction, and the maximum of 19.30 s is two steps.
+    - The same arithmetic explains 77 of the 1,153 logged 10-second windows in which
+    requests were running but throughput was reported as zero: the window falls inside
+    one long step. In those windows the engine reported 0.3 tok/s of generation with
+    four running requests, which is one token per request per step —
+    4 ÷ 10.4 s = 0.38 tok/s. A caller generating tokens while another caller does a
+    cold read is therefore not slow but nearly frozen.
+    - Ruled out by measurement: prefill is 790 tok/s today against 786–794 tok/s in
+    the morning, so there is no regression; `nvidia-smi dmon` during a 42,064-token
+    prefill showed sm 100%, power 454–603 W against a 600 W limit, and no active
+    throttle reason; rxpci stayed at 0–37 MB/s, which refutes the hypothesis that the
+    CPU-offloaded PLE transfer is the bottleneck. Two concurrent readers each reached
+    367 tok/s for an aggregate of 735 tok/s, so prefill is one fixed pipe that
+    concurrency divides rather than a per-request penalty.
+    - Proposed change, to be applied in the containerisation window rather than its own
+    restart: `--max-num-batched-tokens 2048` (2.6 s per step) plus
+    `--long-prefill-token-threshold 1024`, which leaves half the budget for other
+    callers so a short request joins the same step instead of waiting for a whole one.
+    Aggregate prefill throughput is expected to fall by 1-2% from the extra per-step
+    overhead; this is an estimate, and the change is to be reverted if a repeat of the
+    42,064-token cold read drops below 750 tok/s.
+- **Provenance of the running engine (2026-09-11, read-only).** The resident server
+  gets the padding fix from `PYTHONPATH=/root/q4/plugin-padfix`, which shadows the
+  editable install. The editable `.pth` resolves to a different tree,
+  `/root/q4/plugin`, whose `quantization/fused_moe.py` lacks the
+  `topk_ids = topk_ids.clamp(min=0)` line; the two trees also differ in `loader.py`,
+  `ops.py` and `plugin.py`, and only the padfix tree carries
+  `quantization/ple_iq4_nl.py`. Any packaging of this engine must install exactly one
+  copy of the fixed plugin and must not rely on `PYTHONPATH` ordering.
+
 ## Design decisions
 
 ### D1 — Implement IQ4_NL as a Level-3 PLE embedding method, not a worker
