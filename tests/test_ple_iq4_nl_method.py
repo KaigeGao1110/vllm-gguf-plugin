@@ -406,12 +406,19 @@ def test_iq4_nl_kernel_scale_formula_matches_float16_bits():
     sign = (bits >> 15) & 1
     exponent = (bits >> 10) & 0x1F
     mantissa = bits & 0x3FF
-    # Same construction as the Triton kernel: normal scales are the exact
-    # float32 bit pattern ((e + 112) << 23) | (m << 13).
-    normal_bits = ((exponent + 112) << 23) | (mantissa << 13)
+    # Same construction as the Triton kernel, factor by factor, in float32:
+    # normal scales are (1024 + m) * 2**e * 2**-25 with exponent 31 clamped
+    # before the shift; subnormal scales are m * 2**-24.
+    normal_exponent = torch.where(exponent == 31, 0, exponent)
+    normal = (
+        (mantissa + 1024).to(torch.float32)
+        * (1 << normal_exponent).to(torch.float32)
+        * torch.tensor(2.9802322387695312e-08, dtype=torch.float32)
+    )
     scale = torch.where(
         exponent == 0,
-        mantissa.to(torch.float32) * (2.0**-24),
+        mantissa.to(torch.float32)
+        * torch.tensor(5.9604644775390625e-08, dtype=torch.float32),
         torch.where(
             exponent == 31,
             torch.where(
@@ -419,7 +426,7 @@ def test_iq4_nl_kernel_scale_formula_matches_float16_bits():
                 torch.tensor(float("inf")),
                 torch.tensor(float("nan")),
             ),
-            normal_bits.view(torch.float32),
+            normal,
         ),
     )
     scale = torch.where(sign == 1, -scale, scale)
@@ -441,7 +448,8 @@ def test_iq4_nl_ple_cuda_lookup_and_graph_replay(monkeypatch, pinned, rank):
     module.load_weights(iter(tensors))
     layer = module.ngram_embedding
     layer.embedding_method.process_weights_after_loading(layer)
-    reference = _reference_rows(packed).to(layer.params_dtype).to("cuda")
+    # Kept on CPU: expected rows are compared against output.cpu().
+    reference = _reference_rows(packed).to(layer.params_dtype)
     ids = torch.tensor([[3, 4], [7, 0]], device="cuda")
     lookup_fn = layer._lookup if pinned else torch.compile(layer, fullgraph=True)
 

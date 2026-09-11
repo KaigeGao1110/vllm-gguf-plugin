@@ -238,33 +238,43 @@ def _lookup_iq4_nl_ple_embedding_kernel(
     block_index = offsets // 32
     value_in_block = offsets % 32
     byte_index = tl.where(value_in_block < 16, value_in_block, value_in_block - 16)
+    # The table is uint8; widen every loaded byte before shifting or masking.
+    # Triton keeps uint8 arithmetic in uint8, so `byte << 8` or `bits & 0x3FF`
+    # on the raw load would overflow (or fail to compile).
     code = tl.load(
         weight_ptr + local_idx * row_bytes + block_index * 18 + 2 + byte_index,
         mask=load_mask,
         other=0,
-    )
+    ).to(tl.int32)
     code = tl.where(value_in_block < 16, code & 0xF, (code >> 4) & 0xF)
     block_base = weight_ptr + local_idx * row_bytes + block_index * 18
-    scale_low = tl.load(block_base, mask=load_mask, other=0)
-    scale_high = tl.load(block_base + 1, mask=load_mask, other=0)
+    scale_low = tl.load(block_base, mask=load_mask, other=0).to(tl.int32)
+    scale_high = tl.load(block_base + 1, mask=load_mask, other=0).to(tl.int32)
     # Little-endian float16 bits rebuilt from the two raw bytes.
-    scale_bits = scale_low + (scale_high << 8)
+    scale_bits = scale_low | (scale_high << 8)
     sign = (scale_bits >> 15) & 1
     exponent = (scale_bits >> 10) & 0x1F
     mantissa = scale_bits & 0x3FF
-    # Normal scales are (1 + m/1024) * 2**(e-15). The float16 significand is a
-    # subset of the float32 significand, so the exact value is the bit pattern
-    # ((e - 15 + 127) << 23) | (m << 13); reinterpreting the integer is exact,
-    # unlike an exp2-based computation whose approximation is only
-    # correctly rounded for large exponents.
-    normal_bits = ((exponent + 112) << 23) | (mantissa << 13)
+    # Normal scales are (1024 + m) * 2**e * 2**-25. Each factor is exactly
+    # representable in float32 (an 11-bit integer, a power of two, and the
+    # literal 2**-25) and every product has at most 11 significant bits inside
+    # the float32 range, so the multiplication is exact. This avoids libdevice
+    # exp2/pow, whose results are not correctly rounded for all exponents.
+    # Exponent 31 (inf/NaN) is clamped before the shift and selected below.
+    normal_exponent = tl.where(exponent == 31, 0, exponent)
+    normal = (
+        (mantissa + 1024).to(tl.float32)
+        * (1 << normal_exponent).to(tl.float32)
+        * 2.9802322387695312e-08
+    )
     scale = tl.where(
         exponent == 0,
-        mantissa.to(tl.float32) * tl.exp2(-24.0),
+        # Subnormal: m * 2**-24, with 2**-24 written as its exact literal.
+        mantissa.to(tl.float32) * 5.9604644775390625e-08,
         tl.where(
             exponent == 31,
             tl.where(mantissa == 0, float("inf"), float("nan")),
-            tl.bitcast(normal_bits.to(tl.int32), tl.float32),
+            normal,
         ),
     )
     scale = tl.where(sign == 1, -scale, scale)
