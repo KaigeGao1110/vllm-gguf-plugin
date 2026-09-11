@@ -307,6 +307,13 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
     """
 
     zero_copy_tensor_names = (_PLE_PACKED_SUFFIX,)
+    # transform_weights concatenates the indexer q/k tensors into the native
+    # ReplicatedLinear index_qk_proj, a name that never appears in the GGUF
+    # name map, so the loader cannot infer its precision. It must be declared
+    # unquantized: the GGUF linear method has no v2 loader for ReplicatedLinear
+    # and would leave the parameter uninitialised. transform_weights rejects
+    # quantized indexer q/k, so the concatenated weight is always floating.
+    extra_unquantized_modules = ("self_attn.indexer.index_qk_proj",)
 
     @classmethod
     def matches(cls, config: PretrainedConfig) -> bool:

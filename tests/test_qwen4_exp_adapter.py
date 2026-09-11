@@ -611,3 +611,29 @@ def test_qwen4_exp_rejects_vision_outside_this_text_only_experiment():
         Qwen4ExpGGUFAdapter().build_name_map(
             SimpleNamespace(mm_proj="vision.gguf"), _transform_config()
         )
+
+
+def test_qwen4_exp_concatenated_indexer_projection_is_unquantized_in_vllm_names():
+    """index_qk_proj is built by transform_weights, so the GGUF name map cannot
+    mark it unquantized; the adapter must. The declaration goes through the
+    model's real rename mapper, as the loader's quant config does, and must
+    select the vLLM prefix of the ReplicatedLinear (the second full load failed
+    with 'Tried to load weights of size [640, 2560] to a parameter of size [0]').
+    """
+    from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpForConditionalGeneration
+
+    from vllm_gguf_plugin.quantization.utils import is_layer_skipped_gguf
+    from vllm_gguf_plugin.weights_adapter.qwen4_exp import Qwen4ExpGGUFAdapter
+
+    mapper = Qwen4ExpForConditionalGeneration.hf_to_vllm_mapper.get_rename_mapper()
+    modules = mapper.apply_list(list(Qwen4ExpGGUFAdapter().extra_unquantized_modules))
+
+    assert is_layer_skipped_gguf(
+        "language_model.model.layers.3.self_attn.indexer.index_qk_proj", modules
+    )
+    assert not is_layer_skipped_gguf(
+        "language_model.model.layers.3.self_attn.o_proj", modules
+    )
+    assert not is_layer_skipped_gguf(
+        "language_model.model.layers.0.mlp.shared_expert.down_proj", modules
+    )
