@@ -767,18 +767,45 @@ for community support.
     CPU-offloaded PLE transfer is the bottleneck. Two concurrent readers each reached
     367 tok/s for an aggregate of 735 tok/s, so prefill is one fixed pipe that
     concurrency divides rather than a per-request penalty.
-    - Proposed change: `--max-num-batched-tokens 2048` (2.6 s per step) plus
-    `--long-prefill-token-threshold 1024`, which leaves half the budget for other
-    callers so a short request joins the same step instead of waiting for a whole one.
-    Aggregate prefill throughput is expected to fall by 1-2% from the extra per-step
-    overhead; this is an estimate, and the change is to be reverted if a repeat of the
-    42,064-token cold read drops below 750 tok/s.
-    - Order of application (Kaige, 2026-09-11): validate the pair on the containerised
-    engine on a second box first, then apply it to this server in one restart. The
-    validation must drive its own load — two concurrent 42,064-token cold reads plus a
-    four-token probe every two seconds — because the symptom only appears while a long
-    prefill occupies the step, and an otherwise idle server answers the probe in 0.4 s
-    even at 8192.
+- **Run 25 — tuning the scheduler against that stall (2026-09-11 23:02Z–23:33Z).**
+  Kaige ordered the change applied immediately rather than waiting for a second box.
+  Every configuration was measured under the same load: two concurrent 42,064-token
+  cold reads with unique prefixes, plus a four-token probe every two seconds.
+
+    | batched / long-prefill | probe p50 | probe p90 | readers aggregate |
+    | --- | --- | --- | --- |
+    | 8192 / unset (before) | 41.76 s | 47.81 s | 752 tok/s |
+    | 2048 / 1024 | 13.62 s | 18.37 s | 803 tok/s |
+    | 4096 / 512 | 36.01 s | 50.63 s | **209 tok/s** |
+    | 4096 / 1024 (resident) | 10.94 s | 12.00 s | 797 tok/s |
+
+    - The first prediction was wrong and the measurement corrected it. A probe that
+    generates four tokens costs five scheduler steps — one to prefill, one per emitted
+    token — so its latency is `(1 + generated tokens) x step time`, and the step time is
+    `concurrent long prefills x chunk / 790 tok/s`. At 4096/1024 with two readers the
+    step is 2.58 s and the probe takes 10.9 s, which is what the table shows; with a
+    single reader the step is 1.28 s and the probe takes 5.79 s against 52 s for the
+    same case before the change.
+    - Chunks below 1024 are not merely less efficient, they collapse: at a 512-token
+    threshold the two readers together sustained 209 tok/s, a quarter of the rate at
+    1024. The knee sits between 512 and 1024, so the per-request chunk cannot be
+    lowered further to shorten the step.
+    - This version of vLLM has no `max_num_partial_prefills`, so the number of
+    concurrent long prefills cannot be capped, and `prefill_schedule_interval` already
+    defaults to 1. The three usable knobs only redistribute a fixed 790 tok/s; the
+    remaining latency is bounded by that rate, which is a property of the IQ4_XS MoE
+    prefill kernel rather than of the scheduler.
+    - Also applied in the same restart: the plugin is now installed from the pinned
+    fork commit `95a55bb` into the venv with `uv pip` (the venv has no pip), the
+    editable install of the unfixed `/root/q4/plugin` tree is gone, and the launcher no
+    longer sets `PYTHONPATH`; the startup self-check asserts that the imported
+    `fused_moe.py` contains `topk_ids.clamp(min=0)` and fails the launch otherwise. The
+    duplicate `--max-model-len` and `--served-model-name` are gone, and vLLM no longer
+    logs `Found duplicate keys`. KV cache rose from 24.62 GiB to 26.37 GiB because the
+    smaller batch needs less activation memory. The launcher is
+    `/root/q4/p3-serve-flash-prod.sh`; the previous one stays on disk as the rollback
+    path, together with the original argv and environment under
+    `/root/q4/backup/r0-20260911/`.
 - **Provenance of the running engine (2026-09-11, read-only).** The resident server
   gets the padding fix from `PYTHONPATH=/root/q4/plugin-padfix`, which shadows the
   editable install. The editable `.pth` resolves to a different tree,
