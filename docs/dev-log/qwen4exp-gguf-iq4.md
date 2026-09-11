@@ -63,16 +63,16 @@ for community support.
   does not list Flash. (The Unsloth model card shows a `vllm serve` example; the
   plugin does not actually support the architecture.)
 - vLLM changed the PLE path substantially:
-  - [#54371](https://github.com/vllm-project/vllm/pull/54371) (merged 2026-09-09)
+    - [#54371](https://github.com/vllm-project/vllm/pull/54371) (merged 2026-09-09)
     replaced the old offload worker with UVA-based pinned-host lookup and a
     three-level design. Level 3, `Qwen4ExpPLEEmbeddingMethod`, owns weight
     creation, lookup format and dequantization, with BF16 and FP8 methods.
-  - [#56273](https://github.com/vllm-project/vllm/pull/56273) (open, head
+    - [#56273](https://github.com/vllm-project/vllm/pull/56273) (open, head
     `e251861a`) adds a packed NVFP4 method that keeps packed rows plus block
     scales in storage and decodes only requested rows, on both the device and
     pinned-host paths. It adds the `lookup_dtype`, `lookup_from_pinned` and
     `record_loaded_rows` hooks that any packed format needs.
-  - Nightly `2a02f6ef` (2026-09-10, wheel `0.28.1rc1.dev628+g2a02f6efe`) contains
+    - Nightly `2a02f6ef` (2026-09-10, wheel `0.28.1rc1.dev628+g2a02f6efe`) contains
     #54371. Its `ngram_embedding.py` is byte-identical to #56273's base
     `b28c3e15`, so #56273 overlays cleanly.
 - llama.cpp: Flash is supported since #27742 (2026-08-27). #28330 (2026-09-10)
@@ -125,10 +125,10 @@ for community support.
   (power limit 600 W, max memory clock 14001 MHz, ECC disabled, 97,887 MiB, driver
   595.71.05 / CUDA 13.2, 123 GB RAM, 61 GB `/dev/shm`). There is no Docker inside the
   container, so vLLM is installed into a virtual environment instead of the image:
-  - `vllm-0.28.1rc1.dev628+g2a02f6efe` from the per-commit wheel index
+    - `vllm-0.28.1rc1.dev628+g2a02f6efe` from the per-commit wheel index
     (`https://wheels.vllm.ai/2a02f6ef…/`), the same build as the CPU test image;
     PyTorch 2.13.0+cu130, Triton 3.7.1, Transformers 5.17.0, `gguf==0.19.0`.
-  - #56273's `ngram_embedding.py` overlaid into the installed package; SHA-256 checked
+    - #56273's `ngram_embedding.py` overlaid into the installed package; SHA-256 checked
     after copying, same value as in D3.
 - Checkpoint downloaded at the pinned revision: the three `UD-IQ4_XS` shards
   (10,946,624 + 49,835,229,856 + 43,836,407,744 bytes). Each shard's SHA-256 matches
@@ -149,31 +149,31 @@ for community support.
   recorded in P0. `ruff check .` and `ruff format --check .` (ruff 0.14.0, whole
   repository) are clean. Merged as `4a99ed1`.
 - Facts P2 established from the nightly source, beyond the P0 notes:
-  - `ple_layer_ids` entries are 1-based: `ple_layer_ids=[2]` attaches the PLE module to
+    - `ple_layer_ids` entries are 1-based: `ple_layer_ids=[2]` attaches the PLE module to
     zero-based layer 1, so shard names are
     `model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_{i}.weight`.
-  - The n-gram table has `padded_vocab_size` rows: the sum of one prime-sized block per
+    - The n-gram table has `padded_vocab_size` rows: the sum of one prime-sized block per
     head (`nth_prime_after(ngram_vocab_size_base - 1, head + 1)`, Miller–Rabin), padded
     to `make_ngram_vocab_size_divisible_by`. For Flash that is 320,001,446 rows padded
     to 320,001,536, exactly the GGUF table's row count.
-  - `Qwen4ExpNGramEmbedding.load_weights` expects every one of `split_ngram_parts`
+    - `Qwen4ExpNGramEmbedding.load_weights` expects every one of `split_ngram_parts`
     shards, including 0-row trailing shards, and checks each shard's shape exactly.
-  - The iterator synthesizes a `.weight_type` companion for every quantized tensor;
+    - The iterator synthesizes a `.weight_type` companion for every quantized tensor;
     the adapter drops the PLE table's companion.
-  - Each `GGUFReader` maps the file at its own address, so aliasing tests must compare
+    - Each `GGUFReader` maps the file at its own address, so aliasing tests must compare
     against the same reader (or write through a second mapping), not a second reader's
     pointer.
 - Real-checkpoint check on the GPU machine (no model construction; script
   `.dev/p3/real_gguf_ple_shards.py`, evidence
   `.dev/evidence/q4gguf-p3-real-ple-shards-4a99ed1-20260911T0250Z.log`), 12 s:
-  - config-derived padded rows 320,001,536; the PLE table is IQ4_NL in shard 2 with
+    - config-derived padded rows 320,001,536; the PLE table is IQ4_NL in shard 2 with
     array shape `[320001536, 90]`;
-  - the yielded tensor shares the reader's memory map; 128 shards with the expected
+    - the yielded tensor shares the reader's memory map; 128 shards with the expected
     names, 2,500,012 rows each, contiguous views covering exactly the whole table;
-  - 64 rows (first, second, middle, last and 60 random) decoded by `ple_cpu` are
+    - 64 rows (first, second, middle, last and 60 random) decoded by `ple_cpu` are
     bit-identical to `gguf.quants.dequantize` (max abs diff 0.0), and the same rows
     read through the shard views match the table bytes;
-  - resident memory 1,116 → 1,127 MiB across the expansion (max RSS 1,767 MiB), so
+    - resident memory 1,116 → 1,127 MiB across the expansion (max RSS 1,767 MiB), so
     the 28.8 GB table is not copied on the way to the loader.
 
 ### 2026-09-11 — P1 accepted after a Core repair; kernel verified on the GPU
@@ -452,19 +452,19 @@ for community support.
   requests). GPU 89.1 GB in use. Host: 32 GB shared memory (the pinned PLE
   table), engine RSS 34 GB, 84 GB still available.
 - Correctness, greedy with thinking off:
-  - a short Chinese prompt returned `我是通义千问，17 乘以 23 等于 391。`
+    - a short Chinese prompt returned `我是通义千问，17 乘以 23 等于 391。`
     (correct product);
-  - a 13,847-token prompt with an access code buried in filler returned `7342`;
-  - a 512-token Chinese expository answer was coherent and on topic.
+    - a 13,847-token prompt with an access code buried in filler returned `7342`;
+    - a 512-token Chinese expository answer was coherent and on topic.
 - Speed (evidence `logs/p3-requests-run11*.log`, `logs/p3-concurrency-run11.log`
   on the box):
-  - short prompt: first token 0.25 s cold, 0.10 s warm;
-  - 13,847-token prompt: first token 16.97 s cold, because vLLM JIT-compiled two
+    - short prompt: first token 0.25 s cold, 0.10 s warm;
+    - 13,847-token prompt: first token 16.97 s cold, because vLLM JIT-compiled two
     Triton kernels (`_fused_post_conv_kernel`, `_qsa_pre_indexer_kernel`) during
     that first request and warned about it; 1.62 s warm, about 8,500 prompt
     tokens per second;
-  - decode: 30.0 tokens per second for a single 512-token answer;
-  - 256-token answers at concurrency 1, 4 and 8: 30.2, 106.8 and 226.5 tokens per
+    - decode: 30.0 tokens per second for a single 512-token answer;
+    - 256-token answers at concurrency 1, 4 and 8: 30.2, 106.8 and 226.5 tokens per
     second in aggregate (30.2, 26.7 and 28.3 per request). Throughput scales
     almost linearly and the GPU showed 62% utilisation at concurrency 8, which
     points at per-step host overhead in eager mode rather than at the kernels.
@@ -483,11 +483,11 @@ for community support.
 - Greedy outputs are identical to run 11: the same short answer, `7342` for the
   13,847-token prompt, and the same 512-token text.
 - Speed (evidence `logs/p3-bench-run12.log` on the box):
-  - short prompt: first token 0.09 s; 13,847-token prompt: 16.92 s cold (the same
+    - short prompt: first token 0.09 s; 13,847-token prompt: 16.92 s cold (the same
     two Triton kernels JIT-compile on the first long request) and 1.62 s warm;
-  - decode: 132.7 tokens per second for a single 512-token answer, 4.4 times
+    - decode: 132.7 tokens per second for a single 512-token answer, 4.4 times
     eager mode;
-  - 256-token answers (`ignore_eos`) at concurrency 1, 4, 8, 16 and 32: 128.7,
+    - 256-token answers (`ignore_eos`) at concurrency 1, 4, 8, 16 and 32: 128.7,
     303.6, 404.0, 505.1 and 562.0 tokens per second in aggregate; 128.8, 76.0,
     50.6, 31.6 and 17.6 per request. The GPU drew 600 W at 100% utilisation.
 - Throughput flattens above 16 concurrent requests. Every routed expert is an IQ
@@ -521,7 +521,7 @@ for community support.
 - Short prompts, 256-token answers with `ignore_eos`:
 
   | concurrency | tok/s total | tok/s per request | first token | peak KV |
-  |---|---|---|---|---|
+  | --- | --- | --- | --- | --- |
   | 32 | 552.9 | 19.7 | 1.84 s | 34.2% |
   | 48 | 572.7 | 13.3 | 2.23 s | 51.2% |
   | 64 | 591.0 | 10.3 | 3.05 s | 68.3% |
@@ -531,15 +531,15 @@ for community support.
   length, so a short request's cost is dominated by its GDN state pages, and the
   pool holds about 93 sequences.
 - 64K prompts (63,4xx tokens, an access code buried at the middle), greedy:
-  - short answers at concurrency 1, 4 and 8: every code correct; first token
+    - short answers at concurrency 1, 4 and 8: every code correct; first token
     80.7 s alone, p50/max 268/329 s at 4 and 430/660 s at 8. Only two requests
     were ever running, the rest waited; prompt throughput was about 770 tokens per
     second at every level, against about 8,500 at 13,847 tokens in run 11.
-  - answers held to 1,024 tokens (`ignore_eos`) at 8 and 12: every code correct;
+    - answers held to 1,024 tokens (`ignore_eos`) at 8 and 12: every code correct;
     at most 7 requests ran at once with KV usage 96.4%, the rest queued (up to 11
     waiting) and none was preempted; first token p50/max 430/679 s at 8 and
     578/1,010 s at 12; decode 11.9 tokens per second in aggregate.
-  - one 64K request takes 13.2–13.8% of the pool, so the practical limit is 7
+    - one 64K request takes 13.2–13.8% of the pool, so the practical limit is 7
     concurrent 64K requests, not the 11.04 that vLLM's startup estimate gives
     (the estimate leaves out the blocks the GDN groups hold per request).
 - During the first long requests vLLM warned about Triton JIT for
@@ -556,6 +556,80 @@ for community support.
   fraction; and prefix caching off, which removes the `align` state blocks at the
   cost of prefix reuse. The GGUF carries no MTP tensors (1,224 tensors, `blk.0`
   to `blk.47`), although `config.json` declares one MTP layer.
+
+### 2026-09-11 — P3 runs 14–18: FP8 KV, scheduler sweep and MTP
+
+- Serve script `.dev/p3/p3-serve-64k-tuned.sh`: the run 13 tree with 64K context,
+  `--max-num-seqs 96` and `--gpu-memory-utilization 0.94`. Each run served one
+  63,415-token needle prompt and then short prompts at concurrency 32, 48, 64 and
+  82 with 256-token answers (`ignore_eos`), all greedy. Evidence
+  `.dev/evidence/q4gguf-p3-{serve,bench}-run1[4-8]*.log`.
+- Run 14 used an FP8 main KV cache. The pinned nightly rejects it in
+  `nvidia/qsa.py`, so the two `vllm/` files of upstream #55557 were applied to the
+  venv (backup `/root/q4/p3/pr55557-backup/`). Flags:
+  `--kv-cache-dtype fp8 --attention-config '{"indexer_kv_dtype": "fp8"}'`.
+    - The attention block grew to 3,136 tokens (1,568 with BF16).
+    - The greedy short answer matched BF16, and the needles at 13,847 and 63,415
+    tokens were correct.
+    - Short throughput was 1–3% below run 13.
+    - The block count rose 18% over run 13, all of it from the higher memory
+    fraction, so each short request still takes 0.90% of the pool.
+- Runs 15–18 each change one setting from run 14:
+
+  | run | change | model load | KV memory | KV tokens | 64K first token | 64K share | short tok/s at 32/48/64/82 | per short request |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 14 | — | 61.84 GiB | 24.67 GiB | 1,454,899 | 80.5 s | 9.9% | 534 / 560 / 578 / 550 | 0.90% |
+  | 15 | `--no-enable-prefix-caching` | 61.84 GiB | 24.67 GiB | 1,678,729 | 80.6 s | 3.9% | 537 / 560 / 576 / 547 | 0.90% |
+  | 16 | `--max-num-batched-tokens 16384` | 62.63 GiB | 22.47 GiB | 1,326,011 | 82.5 s | 6.9% | 534 / 556 / 573 / 545 | 0.99% |
+  | 17 | `--max-num-batched-tokens 32768` | 64.20 GiB | 18.04 GiB | 1,063,867 | 83.5 s | 7.0% | 532 / 554 / 572 / 520 | 1.23% |
+  | 18b | MTP, 3 draft tokens | 64.75 GiB | 20.13 GiB | 767,707 | 81.8 s | 14.9% | 265 / 279 / 275 / 275 | ~3.7% |
+
+  Every needle was correct, and no server log had an error.
+- Prefix caching off (run 15):
+    - Short requests are unchanged.
+    - One 64K request takes 3.9% of the pool instead of 9.9%, an estimated 25
+    concurrent 64K requests against 10. These estimates are not measured.
+    - The cost is losing prefix reuse: a repeated 64K prefix is prefilled again,
+    taking about 80 s.
+- A larger `max_num_batched_tokens` (runs 16–17) does not speed up prefill.
+    - The 64K first token gets 2–3 s slower.
+    - The reported model load grows by 0.8 and 2.4 GiB, and the KV pool shrinks by
+    9% and 27%.
+    - At 32768, the 82 level filled the pool: 81 requests ran and one waited 38 s.
+    - 64K prefill is bound by kernel compute, not by the chunk size, so 8192 stays.
+    - The smaller 64K share (6.9–7.0%) fits fewer chunk boundaries carrying GDN
+    `align` state.
+- MTP (runs 18 and 18b):
+    - **Draft.** The GGUF has no MTP layer. `.dev/p3/p3-extract-mtp.py` pulls the
+    `mtp.*` tensors of `Qwen/Qwen3.8-Flash-Next-FP8` over HTTP ranges into
+    `/root/q4/mtp-fp8`: 3,101 tensors, 2.51 GiB, block FP8 experts.
+    - **Config.** `--speculative-config '{"method": "mtp", "model": "/root/q4/mtp-fp8",
+    "num_speculative_tokens": 3, "draft_load_config": {"load_format":
+    "safetensors"}}'`.
+    - **Run 18 failed at startup.** Model Runner V2's `load_eagle_model` calls
+    `get_model` without `draft_load_config`, so the plugin's GGUF loader received
+    the safetensors directory: `Unrecognised GGUF reference: /root/q4/mtp-fp8`.
+    Upstream #55337 (open, review required) passes it through. The same
+    three-line change was applied to the venv
+    (`q4gguf-p3-mtp-draft-load-config.diff`, backup
+    `/root/q4/p3/mtp-patch-backup/`).
+    - **Run 18b loaded**, with the draft adding 2.9 GiB. vLLM warned that no KV
+    cache group could be identified as the draft's. It treated every group,
+    including the four GDN groups, as a draft group, which disables prefix-cache
+    reuse.
+    - **Concurrency.** A short request took about 3.7% of the pool, so at most 27
+    requests ran at every level and the rest queued (first token p95 24–53 s).
+    - **Throughput.** Aggregate throughput was half of run 14. Each request got
+    about 11 tokens/s with 27 running, against 19 at 32 without MTP; verifying 4
+    tokens per request multiplies the per-row MoE kernel work.
+    - **Acceptance.** Mean acceptance length was 1.9–2.0, with per-position rates of
+    0.56–0.60, 0.24–0.31 and 0.09–0.12. Answers run past EOS under
+    `ignore_eos`, which probably lowers these figures.
+    - **Single stream.** With the same answers, decode was 234 and 204 tokens/s,
+    against 134 and 151 in run 14.
+    - **Verdict.** MTP pays only at low concurrency on this stack.
+- The box venv now carries #55557 and the #55337 change on top of nightly
+  `2a02f6ef` plus #56273.
 
 ## Design decisions
 
@@ -609,7 +683,7 @@ then copies each shard into the method's storage. No step may allocate the
 ## Work packages
 
 | ID | Scope | State |
-|---|---|---|
+| --- | --- | --- |
 | P0 | Base pin, test environment, contracts, this log | done |
 | P1 | IQ4_NL PLE embedding method, Triton lookup kernel, `from_quant_config` hook | accepted after Core kernel repair, merged `2e9faa2`; 32 passed on GPU |
 | P2 | Port the `qwen4_exp` adapter to nightly and stream PLE shards | accepted, merged `4a99ed1`; real-checkpoint check passed |
