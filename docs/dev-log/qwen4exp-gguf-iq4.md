@@ -631,6 +631,48 @@ for community support.
 - The box venv now carries #55557 and the #55337 change on top of nightly
   `2a02f6ef` plus #56273.
 
+### 2026-09-11 — P3 run 19: MTP with 1 and 2 draft tokens, and why MTP loses here
+
+- Run 19 repeats run 18b with `num_speculative_tokens` 1 and 2, sending short prompts
+  at 32 and 48 concurrent requests (evidence
+  `q4gguf-p3-{serve,bench}-run19-mtp{1,2}*.log`). KV memory stays at about
+  20.1–20.4 GiB, but the pool holds fewer tokens as the draft grows.
+
+  | draft tokens | KV tokens | tok/s at 32 / 48 | per request at 32 | KV per short request | mean acceptance length |
+  | --- | --- | --- | --- | --- | --- |
+  | 0 (run 14) | 1,454,899 | 534 / 560 | 19.1 | 0.90% | — |
+  | 1 | 975,329 | 456 / 467 | 16.2 | 2.0% | 1.56–1.60 |
+  | 2 | 850,243 | 359 / 351 | 12.6 | 2.85% | 1.81 |
+  | 3 (run 18b) | 767,707 | 265 / 279 | 11.0 at 27 running | ~3.7% | 1.89–2.02 |
+
+  The server logged no errors. With 2 draft tokens at 48, only 35 requests ran and the
+  rest queued.
+- MTP costs throughput on this stack because decode is already compute-bound at these
+  batch sizes.
+    - Without MTP, from 32 to 82 concurrent requests, a decode step costs a near-constant
+    1.55–1.64 ms per token row (52 ms at 32, 133 ms at 82). Every extra row costs full
+    price.
+    - MTP verifies 1+k rows per request per step but keeps only the acceptance length.
+    With MTP the step still costs about 1.5–1.6 ms per row (98, 144 and 177 ms for 64,
+    96 and 108 rows), so throughput scales as acceptance length ÷ (1+k).
+    - That predicts 0.79, 0.60 and 0.49 of the no-MTP rate; the measured ratios are 0.85,
+    0.67 and 0.50.
+    - The single-stream gain in run 18b comes from batch 1, where a step takes 7.5 ms
+    for one row and 8.5 ms for four.
+- Pytest for the two upstream PRs, run with the same `_C_gguf` build on every tree:
+
+  | tree | failed | passed | skipped |
+  | --- | --- | --- | --- |
+  | `main` `d4c1f0d` | 81 | 1,552 | 578 |
+  | negative-id branch | 81 | 1,554 | 578 |
+  | `weight_type` branch | 81 | 1,560 | 578 |
+
+    - The 81 failure IDs are identical on all three trees: 68 Triton
+    `OutOfResources: shared memory` errors in `test_moe`, 12 offline model downloads,
+    and `test_register_sets_engine_args_for_gguf_model`.
+    - The branches were opened as vllm-gguf-plugin #130 and #131, and validation
+    comments were posted on plugin #125 and vLLM #55557.
+
 ## Design decisions
 
 ### D1 — Implement IQ4_NL as a Level-3 PLE embedding method, not a worker
