@@ -253,7 +253,13 @@ class Qwen4ExpGGUFAdapter(Qwen35GGUFAdapter):
     adds QSA, hyper-connections, and PLE tensors.  Inheriting the GDN layout
     declaration and restoration helpers keeps the V-head reorder tied to the
     existing, tested vLLM GGUF layout contract.
+
+    The packed PLE table is declared zero-copy: the iterator yields it as a
+    view of the memory-mapped GGUF payload so the 28.8 GB table is never
+    privately copied on the way to the native PLE loader.
     """
+
+    zero_copy_tensor_names = (_PLE_PACKED_SUFFIX,)
 
     @classmethod
     def matches(cls, config: PretrainedConfig) -> bool:
