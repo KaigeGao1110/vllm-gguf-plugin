@@ -806,6 +806,21 @@ for community support.
     candidate is host-side, because exactly one thread of 32 sits at 99.9% during
     prefill, which works out to ~1.23 ms of CPU per token, and 1/1.23 ms = 813 tok/s
     lands on the measured 786-845.
+    - The other suspect, the host-resident engram/PLE table, was ruled out on
+    2026-09-12 by trying to put it on the card. Started with
+    `--engram-config '{"cpu_offload": false}'` and the context already halved to 131072,
+    the engine never reached readiness: loading the model alone took 88.24 GiB, vLLM
+    computed `Available KV cache memory: -0.82 GiB`, and startup failed with
+    `No available memory for the cache blocks`. The card holds 95.6 GiB and
+    `--gpu-memory-utilization 0.94` budgets 89.9 GiB, so even a utilization of 1.0 would
+    leave under 6 GiB for the KV cache, with no headroom and a context far below the
+    262144 the catalog pins. Keeping that table on the host is therefore not a tuning
+    choice on this card but the only configuration that fits, and the ceiling cannot be
+    charged to the offload. That leaves the host thread as the one remaining candidate.
+    The A/B cost 11 min 10 s of downtime; it would have cost 25 had the window script
+    been left to time out, since it waits for a readiness that a dead engine can never
+    reach. A script that starts a candidate configuration should watch for the engine
+    process dying, not only for the readiness endpoint answering.
     - Also applied in the same restart: the plugin is now installed from the pinned
     fork commit `95a55bb` into the venv with `uv pip` (the venv has no pip), the
     editable install of the unfixed `/root/q4/plugin` tree is gone, and the launcher no
