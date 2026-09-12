@@ -28,7 +28,7 @@ from .params import (
     _gguf_moe_weight_loader,
     _gguf_moe_weight_type_loader,
 )
-from .utils import MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
+from .utils import MMQ_MOE_TRITON_TYPES, MMVQ_QUANT_TYPES, logger
 
 
 def _fused_moe_gguf(
@@ -62,8 +62,8 @@ def _fused_moe_gguf(
 
     out_hidden_states = torch.empty_like(x)
     if (
-        weight_type2 in MMQ_QUANT_TYPES
-        and weight_type in MMQ_QUANT_TYPES
+        weight_type2 in MMQ_MOE_TRITON_TYPES
+        and weight_type in MMQ_MOE_TRITON_TYPES
         and x.shape[0] > 64
     ):
         num_tokens, _ = x.shape
