@@ -802,10 +802,35 @@ for community support.
     17.4 TFLOP/s, about 7% of the card's fp16 peak. Adding the down projection puts the
     whole MoE at roughly 23 ms against the 107 ms each layer gets at 800 tok/s, so the
     MoE kernel accounts for about 22% of the ceiling. Driving it to zero would move
-    800 tok/s to only about 1025. The larger share is still unattributed; the leading
-    candidate is host-side, because exactly one thread of 32 sits at 99.9% during
-    prefill, which works out to ~1.23 ms of CPU per token, and 1/1.23 ms = 813 tok/s
-    lands on the measured 786-845.
+    800 tok/s to only about 1025. The larger share sits on the GPU, which is saturated:
+    sampled once a second for a minute under live traffic, `utilization.gpu` was 100%
+    in 60 of 60 samples, the SM clock held 2767 MHz and the board drew a median 515 W
+    with a 605 W peak against its 600 W limit.
+    - An earlier revision of this entry named a host thread as the leading candidate,
+    on the grounds that exactly one thread of 32 sat at 99.9% during prefill, giving
+    ~1.23 ms of CPU per token, and that 1/1.23 ms = 813 tok/s landed on the measured
+    786-845. **That was circular.** PyTorch synchronises with CUDA by spinning, and a
+    spinning thread burns CPU for exactly as long as it waits, so its CPU time per
+    token is identically the wall-clock time per token. The agreement was an identity,
+    not evidence, and it survives unchanged whether the host or the device is the
+    bottleneck. Sampling `/proc/<pid>/task/*/stat` confirms the shape but not the
+    cause: one thread at 76.9%, the other 128 under 1% combined, and `wchan` empty in
+    450 of 589 samples, which says user space rather than blocked in the kernel -- and
+    a CUDA spin-wait is user space.
+    - The host-resident engram/PLE gather was the concrete suspect behind that
+    candidate and is also ruled out. Measured with the plugin's own
+    `gather_iq4_nl_rows` at the shipped shapes (20,000,003 rows of width 160, 4096
+    tokens x 8 heads per step, the table's real 1.68 GiB), one step takes a median
+    31.8 ms single-threaded, or 8 us per token against a 1230 us budget: 0.6% of the
+    step. Note the model has one PLE layer, not 48, and the PLE width is 160, not the
+    2560 hidden size.
+    - What the GPU is doing is not efficient work. The MoE reaches 17.4 TFLOP/s, ~7%
+    of fp16 peak, and memory-bandwidth utilisation sits at a median 53%, so neither
+    FLOPs nor bandwidth is saturated while the board is nonetheless busy every sampled
+    second and near its power limit. That is the signature of the IQ4_XS dequantisation
+    itself -- integer unpacking that costs power and occupancy without showing up as
+    either FLOPs or bandwidth. Any further gain has to come from cheaper dequantisation
+    on the device, not from the host and not from the scheduler.
     - The other suspect, the host-resident engram/PLE table, was ruled out on
     2026-09-12 by trying to put it on the card. Started with
     `--engram-config '{"cpu_offload": false}'` and the context already halved to 131072,
