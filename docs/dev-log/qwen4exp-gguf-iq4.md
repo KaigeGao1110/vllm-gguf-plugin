@@ -787,14 +787,25 @@ for community support.
     single reader the step is 1.28 s and the probe takes 5.79 s against 52 s for the
     same case before the change.
     - Chunks below 1024 are not merely less efficient, they collapse: at a 512-token
-    threshold the two readers together sustained 209 tok/s, a quarter of the rate at
-    1024. The knee sits between 512 and 1024, so the per-request chunk cannot be
-    lowered further to shorten the step.
+    threshold the two readers together sustained 209 tok/s, a quarter of the rate
+    at 1024. The knee sits between 512 and 1024, so the per-request chunk cannot be
+    lowered further to shorten the step. (Keep the number off the start of a line:
+    markdownlint reads a line-leading digit-and-period as an ordered-list marker and
+    silently renumbers it to "1.", which turns the measurement into nonsense.)
     - This version of vLLM has no `max_num_partial_prefills`, so the number of
     concurrent long prefills cannot be capped, and `prefill_schedule_interval` already
     defaults to 1. The three usable knobs only redistribute a fixed 790 tok/s; the
-    remaining latency is bounded by that rate, which is a property of the IQ4_XS MoE
-    prefill kernel rather than of the scheduler.
+    remaining latency is bounded by that rate rather than by the scheduler.
+    - That rate is **not** mostly the MoE kernel, which is what this entry originally
+    assumed. Measured 2026-09-12 on an idle card at the production shapes
+    (40960 rows, 2560x1280): the up/gate projection takes a median 15.4 ms and reaches
+    17.4 TFLOP/s, about 7% of the card's fp16 peak. Adding the down projection puts the
+    whole MoE at roughly 23 ms against the 107 ms each layer gets at 800 tok/s, so the
+    MoE kernel accounts for about 22% of the ceiling. Driving it to zero would move
+    800 tok/s to only about 1025. The larger share is still unattributed; the leading
+    candidate is host-side, because exactly one thread of 32 sits at 99.9% during
+    prefill, which works out to ~1.23 ms of CPU per token, and 1/1.23 ms = 813 tok/s
+    lands on the measured 786-845.
     - Also applied in the same restart: the plugin is now installed from the pinned
     fork commit `95a55bb` into the venv with `uv pip` (the venv has no pip), the
     editable install of the unfixed `/root/q4/plugin` tree is gone, and the launcher no
