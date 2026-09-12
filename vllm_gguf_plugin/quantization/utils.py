@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Mapping
 from types import MappingProxyType
 
@@ -73,3 +74,27 @@ IMATRIX_QUANT_TYPES = {
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+
+# IQ4_XS and IQ4_NL have no CUDA MMQ kernel, so they are absent from
+# MMQ_QUANT_TYPES. But triton/fused_moe/iq_quant/iq4_xs.py is a real tl.dot tile
+# GEMM that dequantizes in registers, it is registered in TRITON_MOE_DISPATCH,
+# and ops.ggml_moe_a8 already falls back to it whenever the CUDA kernel is
+# missing. Nothing ever reaches it: the gate in fused_moe.py stops IQ types
+# first, so every prefill chunk of an IQ4_XS MoE goes through ggml_moe_a8_vec, a
+# kernel written for decode. On the RTX PRO 6000 box that is what caps prefill at
+# ~790 tok/s, which in turn sets the scheduler step time that makes short
+# requests wait behind long reads.
+#
+# This is deliberately a separate set rather than a wider MMQ_QUANT_TYPES.
+# linear.py reads MMQ_QUANT_TYPES too, with a threshold of x.shape[0] <= 2..6,
+# so widening it there would also reroute the attention projections and the
+# shared expert. Keep that blast radius out of this change; MoE only.
+MMQ_MOE_TRITON_TYPES = MMQ_QUANT_TYPES | {
+    WeightType.IQ4_XS,
+    WeightType.IQ4_NL,
+}
+
+# Rollback without reinstalling: with the switch off the dispatch is
+# byte-equivalent to using MMQ_QUANT_TYPES directly.
+if os.environ.get("GGUF_PLUGIN_IQ_MOE_MMQ", "1") != "1":
+    MMQ_MOE_TRITON_TYPES = MMQ_QUANT_TYPES
